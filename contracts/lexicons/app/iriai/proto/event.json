@@ -1,0 +1,37 @@
+{
+  "lexicon": 1,
+  "id": "app.iriai.proto.event",
+  "description": "PlaceProto event sidecar. Adds the required PlaceProto location to a community.lexicon.calendar.event record stored in the same repository.",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A PlaceProto event sidecar. eventUri names the community event this sidecar belongs to, in the same repository. The sidecar's location is the PlaceProto location of record; the community event's locations array is only a compatibility copy.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": [
+          "eventUri",
+          "location"
+        ],
+        "properties": {
+          "eventUri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the community.lexicon.calendar.event record in the same repository (repository DID, community event collection, record key). Follows the current event through edits; not a strongRef."
+          },
+          "location": {
+            "type": "union",
+            "closed": false,
+            "refs": [
+              "community.lexicon.location.geo",
+              "community.lexicon.location.address",
+              "community.lexicon.location.fsq",
+              "community.lexicon.location.hthree"
+            ],
+            "description": "Where the event is occurring. One value from the open Location union."
+          }
+        }
+      }
+    }
+  }
+}

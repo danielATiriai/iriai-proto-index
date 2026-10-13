@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "lexicons": [
+    "community.lexicon.calendar.event",
+    "community.lexicon.calendar.rsvp",
+    "community.lexicon.location.address",
+    "community.lexicon.location.fsq",
+    "community.lexicon.location.geo",
+    "community.lexicon.location.hthree"
+  ],
+  "resolutions": {
+    "com.atproto.repo.strongRef": {
+      "uri": "at://did:plc:6msi3pj7krzih5qxqtryxlzw/com.atproto.lexicon.schema/com.atproto.repo.strongRef",
+      "cid": "bafyreifrkdbnkvfjujntdaeigolnrjj3srrs53tfixjhmacclps72qlov4"
+    },
+    "community.lexicon.calendar.event": {
+      "uri": "at://did:plc:mtr7qrqtcyseedx3jyr5o7db/com.atproto.lexicon.schema/community.lexicon.calendar.event",
+      "cid": "bafyreigv256whv46vep4xb2iqn6ag7z5abhvebd46ohuqvopxl56ptobbi"
+    },
+    "community.lexicon.calendar.rsvp": {
+      "uri": "at://did:plc:mtr7qrqtcyseedx3jyr5o7db/com.atproto.lexicon.schema/community.lexicon.calendar.rsvp",
+      "cid": "bafyreiarei3vsjaj36yhc2thobrgzkcsdh6m5pmwy6reik24papzl32qcu"
+    },
+    "community.lexicon.location.address": {
+      "uri": "at://did:plc:mtr7qrqtcyseedx3jyr5o7db/com.atproto.lexicon.schema/community.lexicon.location.address",
+      "cid": "bafyreicdvexolyvp6j6yksqiib7hihwktt6ogalbvyzvtkj6ecrtqqw5fq"
+    },
+    "community.lexicon.location.fsq": {
+      "uri": "at://did:plc:mtr7qrqtcyseedx3jyr5o7db/com.atproto.lexicon.schema/community.lexicon.location.fsq",
+      "cid": "bafyreigqx7wxb4cmz3aex6pcjs6vwqwaqldzn3xvrml3yrpq623u6cnjpe"
+    },
+    "community.lexicon.location.geo": {
+      "uri": "at://did:plc:mtr7qrqtcyseedx3jyr5o7db/com.atproto.lexicon.schema/community.lexicon.location.geo",
+      "cid": "bafyreiansycpa3ggyxqnttzb7ir3dw654s2vk7nldpss6jz65m5zh5frzu"
+    },
+    "community.lexicon.location.hthree": {
+      "uri": "at://did:plc:mtr7qrqtcyseedx3jyr5o7db/com.atproto.lexicon.schema/community.lexicon.location.hthree",
+      "cid": "bafyreic6xmiv4ycbcfvcvj5uu537ytl7hnjazcxf7hhd7g6o6s7p6tonky"
+    }
+  }
+}

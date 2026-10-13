@@ -1,0 +1,120 @@
+{
+  "version": "1.0.0",
+  "description": "Named places for YC (decision 6a, D-26). Places match by coordinates; there is no native Place record in YC (D-29). Coordinates are draft until coordinatesVerified is true, and the release job refuses to ship an unverified place.",
+  "steward": {
+    "handle": "events.iriai.app",
+    "did": "did:plc:kd5s7zyp7nje43ievnqhgzrr"
+  },
+  "places": [
+    {
+      "id": "peace-plaza",
+      "name": "Japantown Peace Plaza",
+      "address": {
+        "$type": "community.lexicon.location.address",
+        "street": "Post St between Buchanan St and Webster St",
+        "locality": "San Francisco",
+        "region": "CA",
+        "postalCode": "94115",
+        "country": "US",
+        "name": "Japantown Peace Plaza"
+      },
+      "location": {
+        "$type": "community.lexicon.location.geo",
+        "latitude": "37.785054",
+        "longitude": "-122.429827",
+        "name": "Japantown Peace Plaza"
+      },
+      "source": "https://en.wikipedia.org/wiki/Japantown,_San_Francisco",
+      "coordinatesSource": "Peace Pagoda map reference cited on the Wikipedia Japantown article, confirmed by Daniel 2026-10-13",
+      "coordinatesVerified": true
+    },
+    {
+      "id": "jcccnc",
+      "name": "Japanese Cultural and Community Center of Northern California (JCCCNC)",
+      "address": {
+        "$type": "community.lexicon.location.address",
+        "street": "1840 Sutter St",
+        "locality": "San Francisco",
+        "region": "CA",
+        "postalCode": "94115",
+        "country": "US",
+        "name": "JCCCNC"
+      },
+      "location": {
+        "$type": "community.lexicon.location.geo",
+        "latitude": "37.7865506",
+        "longitude": "-122.4308591",
+        "name": "JCCCNC"
+      },
+      "source": "https://www.jcccnc.org/calendar-of-events/",
+      "coordinatesSource": "Google Maps place pin, confirmed by Daniel 2026-10-13",
+      "coordinatesVerified": true
+    },
+    {
+      "id": "new-people-cinema",
+      "name": "New People Cinema",
+      "address": {
+        "$type": "community.lexicon.location.address",
+        "street": "1746 Post St",
+        "locality": "San Francisco",
+        "region": "CA",
+        "postalCode": "94115",
+        "country": "US",
+        "name": "New People"
+      },
+      "location": {
+        "$type": "community.lexicon.location.geo",
+        "latitude": "37.785616",
+        "longitude": "-122.4306014",
+        "name": "New People Cinema"
+      },
+      "source": "https://sf.funcheap.com/2026-anime-cinema-club-perfect-blue-remastered-sfs-japantown/",
+      "coordinatesSource": "Google Maps place pin, confirmed by Daniel 2026-10-13",
+      "coordinatesVerified": true
+    },
+    {
+      "id": "christ-united-presbyterian",
+      "name": "Christ United Presbyterian Church",
+      "address": {
+        "$type": "community.lexicon.location.address",
+        "street": "1700 Sutter St (at Laguna St)",
+        "locality": "San Francisco",
+        "region": "CA",
+        "postalCode": "94115",
+        "country": "US",
+        "name": "Christ United Presbyterian Church"
+      },
+      "location": {
+        "$type": "community.lexicon.location.geo",
+        "latitude": "37.7868051",
+        "longitude": "-122.4285592",
+        "name": "Christ United Presbyterian Church"
+      },
+      "source": "https://www.instagram.com/p/DeI3B-STZ9u/",
+      "coordinatesSource": "Google Maps place pin, confirmed by Daniel 2026-10-13",
+      "coordinatesVerified": true
+    },
+    {
+      "id": "buddhist-church-of-sf",
+      "name": "Buddhist Church of San Francisco",
+      "address": {
+        "$type": "community.lexicon.location.address",
+        "street": "1881 Pine St",
+        "locality": "San Francisco",
+        "region": "CA",
+        "postalCode": "94109",
+        "country": "US",
+        "name": "Buddhist Church of San Francisco"
+      },
+      "location": {
+        "$type": "community.lexicon.location.geo",
+        "latitude": "37.7886501",
+        "longitude": "-122.4267882",
+        "name": "Buddhist Church of San Francisco"
+      },
+      "source": "https://www.instagram.com/p/DeI74jBTmyt/",
+      "coordinatesSource": "Google Maps place pin, confirmed by Daniel 2026-10-13",
+      "coordinatesVerified": true
+    }
+  ]
+}

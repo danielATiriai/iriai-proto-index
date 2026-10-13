@@ -1,0 +1,28 @@
+{
+  "name": "iriai-proto-index",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PlaceProto ingestion, index and query API for YC: reads community calendar events and app.iriai.proto.event sidecars from Jetstream, keeps complete pairs in PostgreSQL and Elasticsearch, and serves getEvent and queryEvents.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/main.js",
+    "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
+    "check-contracts": "bash scripts/check-contracts.sh"
+  },
+  "dependencies": {
+    "@atproto/lexicon": "0.7.16",
+    "@atproto/syntax": "0.7.6",
+    "@elastic/elasticsearch": "8.19.2",
+    "h3-js": "4.5.0",
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/pg": "8.15.6",
+    "typescript": "5.9.3"
+  }
+}
