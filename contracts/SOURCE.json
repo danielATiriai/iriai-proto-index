@@ -1,0 +1,10 @@
+{
+  "description": "Vendored from the iriai-proto contracts release. scripts/check-contracts.sh downloads the bundle, checks its SHA-256 and compares every file here, plus src/contracts/location.ts and sidecar.ts against the release commit.",
+  "repository": "danielATiriai/iriai-proto",
+  "tag": "v0.1.0",
+  "commit": "c6a6f2edafe35afd43ea601f2569dfa30c31512b",
+  "bundle": "https://github.com/danielATiriai/iriai-proto/releases/download/v0.1.0/iriai-proto-0.1.0.tar.gz",
+  "sha256": "24d10f1a572539918962dadf18262ff124d72f18fa79fa465dea697aa5da7310",
+  "files": ["lexicons", "lexicons.json", "places", "iriai-proto.config.json"],
+  "sources": ["src/location.ts", "src/sidecar.ts"]
+}

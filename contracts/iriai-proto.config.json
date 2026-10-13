@@ -1,0 +1,10 @@
+{
+  "$comment": "The record namespace is read from here and never hard-coded (D-30). YC records stay under app.iriai.proto; the later move to org.placeproto is a change to this value plus a new release.",
+  "namespace": "app.iriai.proto",
+  "publisher": {
+    "handle": "publisher.iriai.app",
+    "did": "did:plc:s4il46nsgas66jl7tyh6zrec",
+    "authorityRecord": "_lexicon.proto.iriai.app"
+  },
+  "communityEventCollection": "community.lexicon.calendar.event"
+}
