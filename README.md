@@ -55,6 +55,9 @@ npm ci
 npm test                                   # unit tests
 TEST_DATABASE_URL=postgres://… TEST_ELASTICSEARCH_URL=http://localhost:9200 npm test   # everything, as CI runs it
 npm run check-contracts                    # vendored contracts match the v0.1.0 release
+node scripts/acceptance.mjs [base URL]     # live check of a deployed query service
 ```
+
+The **Acceptance** workflow runs the live check from GitHub against `https://query.iriai.app` (or another URL): it lists every sidecar the steward has published from its PDS, then checks that queryEvents near Peace Plaza returns exactly those events, nearest first and earliest first, a few per page, and that getEvent and the health report answer.
 
 `contracts/` is vendored from the v0.1.0 release bundle (SHA-256 in `contracts/SOURCE.json`). `src/contracts/location.ts` and `sidecar.ts` are copies of the release's source files. CI checks both against the release. To move to a new contracts release, replace them and update `SOURCE.json`.

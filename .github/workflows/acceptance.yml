@@ -1,0 +1,27 @@
+name: Acceptance
+
+# Checks a deployed query service against what the steward account has
+# actually published: every event returned near Peace Plaza, by distance and
+# by start time, across pages, plus one getEvent and the health report.
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Query service base URL
+        default: https://query.iriai.app
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Query the live service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - env:
+          QUERY_URL: ${{ inputs.url }}
+        run: node scripts/acceptance.mjs "$QUERY_URL"
