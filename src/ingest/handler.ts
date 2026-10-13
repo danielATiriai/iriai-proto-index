@@ -1,7 +1,7 @@
 import type { Db } from '../db.js'
 import { COLLECTIONS, type Projector } from './projector.js'
 import { forgetPds } from './pds.js'
-import { applyChange, recordUri, setAccountStatus } from './store.js'
+import { applyChange, needsRebuild, recordUri, setAccountStatus } from './store.js'
 
 /** The Jetstream event shapes this service reads (commit, identity, account). */
 export type JetstreamEvent =
@@ -26,7 +26,8 @@ export type JetstreamEvent =
  * Commits to the two PlaceProto collections are applied in revision order and
  * re-project what they affect. Account and identity events matter only for
  * accounts that hold PlaceProto records: an inactive account's events leave
- * search at once, and a returning account is rebuilt from its PDS first.
+ * search at once, and a returning account's events come back only once it
+ * has been rebuilt from its PDS.
  */
 export class Handler {
   /** Accounts holding PlaceProto records; account and identity events for others are skipped. */
@@ -61,20 +62,23 @@ export class Handler {
         return
       }
       case 'account': {
+        // Handled in full every time, so a replay redoes whatever failed.
         const a = evt.account
         if (!this.known.has(a.did)) return
         const changed = await setAccountStatus(this.db, a.did, a.active, a.status ?? null)
-        if (!changed) return
-        if (a.active) {
+        if (a.active && (await needsRebuild(this.db, a.did))) {
           this.log(`account ${a.did} is active again; rebuilding before serving its events`)
-          await this.projector.rebuildAccount(a.did).catch(async (err) => {
-            this.log(`rebuild ${a.did} failed, serving stored records: ${(err as Error).message}`)
-            await this.projector.projectAccount(a.did)
-          })
-        } else {
+          try {
+            await this.projector.rebuildAccount(a.did)
+            return
+          } catch (err) {
+            // Its events stay suppressed; the ingester retries the rebuild.
+            this.log(`rebuild ${a.did} failed, its events stay suppressed until a retry succeeds: ${(err as Error).message}`)
+          }
+        } else if (changed && !a.active) {
           this.log(`account ${a.did} is ${a.status ?? 'inactive'}; suppressing its events`)
-          await this.projector.projectAccount(a.did)
         }
+        await this.projector.projectAccount(a.did)
         return
       }
       case 'identity': {

@@ -1,5 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { errors } from '@elastic/elasticsearch'
 import pg from 'pg'
 import { connect, migrate, type Db } from '../src/db.js'
 import type { Elastic } from '../src/index/elastic.js'
@@ -21,15 +22,44 @@ export async function freshDb(name: string): Promise<Db> {
   return db
 }
 
-/** Just enough of the Elasticsearch client for the projector, kept in memory. */
-export function memoryElastic(): Elastic & { docs: Map<string, unknown> } {
+/** Just enough of the Elasticsearch client for the projector, kept in memory. Writes fail while `down` is set. */
+export function memoryElastic(): Elastic & { docs: Map<string, unknown>; down: boolean } {
   const docs = new Map<string, unknown>()
-  return {
+  const es = {
     docs,
-    index: async ({ id, document }: { id: string; document: unknown }) => void docs.set(id, document),
-    delete: async ({ id }: { id: string }) => void docs.delete(id),
+    down: false,
+    index: async ({ id, document }: { id: string; document: unknown }) => {
+      if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
+      docs.set(id, document)
+    },
+    delete: async ({ id }: { id: string }) => {
+      if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
+      docs.delete(id)
+    },
     get: async ({ id }: { id: string }) => (docs.has(id) ? { found: true, _source: docs.get(id) } : { found: false }),
-  } as never
+  }
+  return es as never
+}
+
+/** The pool, with every query failing like an unreachable Postgres while `down` is set. */
+export function switchableDb(db: Db): Db & { down: boolean } {
+  const state = { down: false }
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop === 'down') return state.down
+      if (prop === 'query' && state.down) {
+        return async () => {
+          throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: 'ECONNREFUSED' })
+        }
+      }
+      const value = Reflect.get(target, prop)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+    set(target, prop, value) {
+      if (prop === 'down') return (state.down = value), true
+      return Reflect.set(target, prop, value)
+    },
+  }) as Db & { down: boolean }
 }
 
 export interface FakeNetwork {

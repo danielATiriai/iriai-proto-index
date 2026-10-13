@@ -2,8 +2,10 @@ import { after, before, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Db } from '../src/db.js'
 import { Handler, type JetstreamEvent } from '../src/ingest/handler.js'
+import { Ingester } from '../src/ingest/ingester.js'
 import { Projector } from '../src/ingest/projector.js'
 import { getRecord } from '../src/ingest/store.js'
+import type { Settings } from '../src/settings.js'
 import { CID_A, CID_B, EVENT, SIDECAR, STEWARD, eventValue, geo, sidecarValue } from './fixtures.js'
 import { databaseUrl, fakeNetwork, freshDb, memoryElastic, type FakeNetwork } from './support.js'
 
@@ -83,6 +85,58 @@ describe('ingestion', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () 
     net.records.set(sidecarUri, { cid: CID_B, value: sidecarValue(AUTHOR, '3kevent000001', geo('37.785', '-122.43')) })
     await handler.handle({ did: AUTHOR, time_us: t++, kind: 'account', account: { did: AUTHOR, active: true } })
     assert.equal((es.docs.get(sidecarUri) as { view: { event: { name: string } } }).view.event.name, 'Walk, after return')
+  })
+
+  it('redoes a failed projection when the change is replayed', async () => {
+    const e = `at://${AUTHOR}/${EVENT}/3kevent000010`
+    const s = `at://${AUTHOR}/${SIDECAR}/3ksidecar0010`
+    await handler.handle(commit(AUTHOR, EVENT, '3kevent000010', eventValue({ name: 'Replayed' })))
+    await handler.handle(commit(AUTHOR, SIDECAR, '3ksidecar0010', sidecarValue(AUTHOR, '3kevent000010', geo('37.78', '-122.43'))))
+    assert.ok(es.docs.has(s))
+    // The deletion is stored, then Elasticsearch fails before the doc is removed.
+    const deletion = commit(AUTHOR, EVENT, '3kevent000010')
+    es.down = true
+    await assert.rejects(handler.handle(deletion))
+    es.down = false
+    assert.equal((await getRecord(db, e))?.deleted, true)
+    assert.ok(es.docs.has(s))
+    // The ingester replays the same event, at the same revision.
+    await handler.handle(deletion)
+    assert.equal(es.docs.has(s), false)
+    const state = await db.query('select complete, reason from index_state where uri = $1', [s])
+    assert.deepEqual(state.rows[0], { complete: false, reason: 'base-deleted' })
+  })
+
+  it('keeps a returning account suppressed while its PDS is unreachable, until a retried rebuild succeeds', async () => {
+    const other = 'did:plc:returningauthor00000000'
+    const s = `at://${other}/${SIDECAR}/3ksidecar0020`
+    const event = eventValue({ name: 'Back again' })
+    const sidecar = sidecarValue(other, '3kevent000020', geo('37.78', '-122.43'))
+    await handler.handle(commit(other, EVENT, '3kevent000020', event))
+    await handler.handle(commit(other, SIDECAR, '3ksidecar0020', sidecar))
+    assert.ok(es.docs.has(s))
+
+    const inactive = { did: other, time_us: t++, kind: 'account' as const, account: { did: other, active: false, status: 'takendown' } }
+    await handler.handle(inactive)
+    assert.equal(es.docs.has(s), false)
+    // It returns while its PDS is down: still suppressed, on the event and on its replay.
+    net.down = true
+    const active = { did: other, time_us: t++, kind: 'account' as const, account: { did: other, active: true } }
+    await handler.handle(active)
+    await handler.handle(active)
+    assert.equal(es.docs.has(s), false)
+    const owed = await db.query('select active, needs_rebuild from accounts where did = $1', [other])
+    assert.deepEqual(owed.rows[0], { active: true, needs_rebuild: true })
+
+    // The minute retry rebuilds it once the PDS answers.
+    net.down = false
+    net.records.set(`at://${other}/${EVENT}/3kevent000020`, { cid: CID_A, value: event })
+    net.records.set(s, { cid: CID_B, value: sidecar })
+    const ingester = new Ingester({ approvedAccounts: [] } as unknown as Settings, db, projector, () => {})
+    await ingester.retry()
+    assert.ok(es.docs.has(s))
+    const rebuilt = await db.query('select needs_rebuild from accounts where did = $1', [other])
+    assert.equal(rebuilt.rows[0].needs_rebuild, false)
   })
 
   it('fetches a base event that predates the sidecar from the author PDS', async () => {

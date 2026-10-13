@@ -34,8 +34,8 @@ export interface QueryDeps {
   index: string
   serviceId: string
   cursorKey: Buffer
-  /** Called before a new paging session opens; returns seconds to wait, or 0. */
-  openSession?: () => number
+  /** Paging-session limit for this caller: `wait` before a first page, `opened` when it returns a cursor. */
+  sessions?: { wait: () => number; opened: () => void }
 }
 
 const KEEP_ALIVE = '15m'
@@ -61,7 +61,7 @@ export async function getEvent(deps: QueryDeps, uriParam: string | null): Promis
     const v = view(doc)
     return { value: v, version: v.version }
   }
-  const sidecar = await getRecord(deps.db, uri.toString())
+  const sidecar = await unavailableOnFailure(() => getRecord(deps.db, uri.toString()))
   if (!sidecar || sidecar.deleted) throw new XrpcError(404, 'SidecarNotFound', 'no indexed sidecar has this URI')
   throw new XrpcError(404, 'EventNotFound', 'the sidecar has no usable community event')
 }
@@ -85,7 +85,7 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
     after = state.after
     created = state.created
   } else {
-    const wait = deps.openSession?.() ?? 0
+    const wait = deps.sessions?.wait() ?? 0
     if (wait > 0) throw new XrpcError(429, 'RateLimitExceeded', 'too many paging sessions from this caller', wait)
     pit = (await unavailableOnFailure(() => deps.es.openPointInTime({ index: deps.index, keep_alive: KEEP_ALIVE }))).id
     created = now
@@ -112,21 +112,29 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
   const hits = res.hits.hits
   const examined = hits.slice(0, q.limit)
   const more = hits.length > q.limit
-  const suppressed = await incompleteAmong(
-    deps.db,
-    examined.map((h) => h._source!.uri),
-  )
+  const snapshot = res.pit_id ?? pit
+  let suppressed: Set<string>
+  try {
+    suppressed = await incompleteAmong(
+      deps.db,
+      examined.map((h) => h._source!.uri),
+    )
+  } catch (err) {
+    if (!q.cursor) await deps.es.closePointInTime({ id: snapshot }).catch(() => {})
+    throw toUnavailable(err)
+  }
   const events = examined.filter((h) => !suppressed.has(h._source!.uri)).map((h) => view(h._source!))
 
   if (!more) {
-    await deps.es.closePointInTime({ id: res.pit_id ?? pit }).catch(() => {})
+    await deps.es.closePointInTime({ id: snapshot }).catch(() => {})
     return { events }
   }
   const last = examined[examined.length - 1]
   const cursor = encodeCursor(
-    { ...expect, pit: res.pit_id ?? pit, after: last.sort ?? [], created, issued: now },
+    { ...expect, pit: snapshot, after: last.sort ?? [], created, issued: now },
     deps.cursorKey,
   )
+  if (!q.cursor) deps.sessions?.opened()
   return { events, cursor }
 }
 
@@ -136,6 +144,7 @@ function isMissingSnapshot(err: unknown): boolean {
   return err.statusCode === 404 || text.includes('search_context_missing_exception') || text.includes('No search context found')
 }
 
+/** Elasticsearch or Postgres failing is the index being unavailable; an Elasticsearch 4xx stays an error. */
 function toUnavailable(err: unknown): unknown {
   if (err instanceof errors.ResponseError && err.statusCode && err.statusCode < 500 && err.statusCode !== 429) return err
   return new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable')

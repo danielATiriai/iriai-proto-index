@@ -9,7 +9,7 @@ import { CursorError } from '../src/query/cursor.js'
 import { parseEventQuery } from '../src/query/params.js'
 import { XrpcError, getEvent, queryEvents, type QueryDeps } from '../src/query/service.js'
 import { CID_A, CID_B, EVENT, OTHER, SIDECAR, STEWARD, eventValue, geo, row, sidecarValue } from './fixtures.js'
-import { databaseUrl, elasticUrl, freshDb } from './support.js'
+import { databaseUrl, elasticUrl, freshDb, switchableDb } from './support.js'
 
 const INDEX = `test-events-${Date.now()}`
 const PEACE_PLAZA = 'latitude=37.785054&longitude=-122.429827'
@@ -151,5 +151,35 @@ describe('query API', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_UR
   it('answers 503 ServiceUnavailable, not an empty page, when the index is down', async () => {
     const down = { ...deps, es: connectElastic('http://127.0.0.1:1') }
     await assert.rejects(queryEvents(down, parseEventQuery(new URLSearchParams(PEACE_PLAZA))), (e: unknown) => e instanceof XrpcError && e.status === 503)
+  })
+
+  it('answers 503 ServiceUnavailable when Postgres is down, for queryEvents and getEvent', async () => {
+    const pg = switchableDb(db)
+    pg.down = true
+    const down = { ...deps, db: pg }
+    const unavailable = (e: unknown) => e instanceof XrpcError && e.status === 503 && e.error === 'ServiceUnavailable'
+    await assert.rejects(queryEvents(down, parseEventQuery(new URLSearchParams(PEACE_PLAZA))), unavailable)
+    await assert.rejects(getEvent(down, uriOf('z')), unavailable)
+  })
+
+  it('counts a paging session only when the answer returns a cursor', async () => {
+    let opened = 0
+    const counted = { ...deps, sessions: { wait: () => 0, opened: () => void opened++ } }
+    const ask = (params: string, cursor?: string) => {
+      const sp = new URLSearchParams(params)
+      if (cursor) sp.set('cursor', cursor)
+      return queryEvents(counted, parseEventQuery(sp))
+    }
+    await ask(`${PEACE_PLAZA}&limit=100`)
+    assert.equal(opened, 0)
+    const first = await ask(`${PEACE_PLAZA}&limit=2`)
+    assert.equal(opened, 1)
+    await ask(`${PEACE_PLAZA}&limit=2`, first.cursor)
+    assert.equal(opened, 1)
+
+    const full = { ...deps, sessions: { wait: () => 120, opened: () => {} } }
+    await assert.rejects(queryEvents(full, parseEventQuery(new URLSearchParams(PEACE_PLAZA))), (e: unknown) => {
+      return e instanceof XrpcError && e.status === 429 && e.retryAfter === 120
+    })
   })
 })

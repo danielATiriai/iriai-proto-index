@@ -26,16 +26,22 @@ export class Limits {
     return 0
   }
 
-  /** Seconds to wait before another paging session may open, or 0. */
-  openSession(caller: string, now = Date.now()): number {
+  /**
+   * Seconds to wait before this caller may be given another paging session,
+   * or 0. Only answers that return a cursor hold a snapshot open, so only
+   * those are counted, by `sessionOpened`.
+   */
+  sessionWait(caller: string, now = Date.now()): number {
     const recent = (this.sessions.get(caller) ?? []).filter((t) => now - t < 3_600_000)
-    if (recent.length >= this.sessionsPerHour) {
-      this.sessions.set(caller, recent)
-      return Math.ceil((recent[0] + 3_600_000 - now) / 1000)
-    }
+    this.sessions.set(caller, recent)
+    if (recent.length < this.sessionsPerHour) return 0
+    return Math.ceil((recent[0] + 3_600_000 - now) / 1000)
+  }
+
+  sessionOpened(caller: string, now = Date.now()): void {
+    const recent = this.sessions.get(caller) ?? []
     recent.push(now)
     this.sessions.set(caller, recent)
-    return 0
   }
 
   private prune(minute: number): void {

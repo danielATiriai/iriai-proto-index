@@ -26,13 +26,16 @@ The method lexicons (`getEvent`, `queryEvents`) are published in contracts v0.2.
 
 ## How it works
 
-- **Ingester** (`ROLE=ingester`) subscribes to Jetstream for `community.lexicon.calendar.event` and `app.iriai.proto.event` only. Posts are fetched on demand later, never streamed (D-12). Events are handled in order. Each record is applied only if its repository revision is newer than the one stored, so replays are harmless, and the cursor is checkpointed only after handling. Each change is re-assembled into complete pairs:
+- **Ingester** (`ROLE=ingester`) subscribes to Jetstream for `community.lexicon.calendar.event` and `app.iriai.proto.event` only. Posts are fetched on demand later, never streamed (D-12). Events are handled in order, and the cursor is checkpointed only after handling. A record is never replaced by an older repository revision, and a replay of the same revision is applied and projected again, so whatever failed the first time is redone. Each change is re-assembled into complete pairs:
   - A sidecar whose base event hasn't been seen fetches that event from the author's PDS. A timeout keeps it pending, never deleted.
   - Invalid records are kept out of the index and never repaired.
-  - An inactive account's events leave search at once. A returning account is rebuilt from its PDS first.
-  - Approved accounts (`APPROVED_ACCOUNTS`, by default the steward events.iriai.app) are listed in full at start, so seeds written before ingestion began are indexed.
+  - An inactive account's events leave search at once. A returning account's events come back only after a rebuild from its PDS succeeds; while its PDS can't be reached they stay out of search, and the rebuild is retried every minute.
+  - Approved accounts (`APPROVED_ACCOUNTS`, by default the steward events.iriai.app) are listed in full at start, before the stream, so seeds written before ingestion began are indexed.
+  - A failed event closes the connection and is replayed on reconnect, with backoff up to 30 s. Postgres, Elasticsearch and network outages are retried for as long as they last. An event that fails three times for any other reason is skipped and recorded in `skipped_events`.
+  - The ingester's `/health` answers 503 once Jetstream has been disconnected for a minute.
   - Locations resolve locally: geo coordinates, and H3 cell centres.
-- **Query** (`ROLE=query`) serves the API from Elasticsearch (`search_after` over a point in time). It checks PostgreSQL to suppress results that stopped being complete.
+- **Query** (`ROLE=query`) serves the API from Elasticsearch (`search_after` over a point in time). It checks PostgreSQL to suppress results that stopped being complete. Rate limits are per caller, by the `X-Real-IP` address Railway's edge sets. `query.iriai.app` stays DNS-only on Cloudflare, since proxying it would make every caller a Cloudflare address. A paging session counts against the hourly limit only when an answer returns a cursor.
+- **Health** (`/xrpc/_health`) reports ingestion lag, sidecar counts by state, inactive accounts and accounts awaiting a rebuild, skipped events, and the index size.
 
 ## Configuration
 
@@ -44,7 +47,7 @@ The method lexicons (`getEvent`, `queryEvents`) are published in contracts v0.2.
 | `CURSOR_KEY` | query | required: 32 random bytes, base64 |
 | `JETSTREAM_URL` | ingester | `wss://jetstream2.us-east.bsky.network/subscribe` |
 | `JETSTREAM_START_CURSOR` | ingester | live, when no checkpoint is stored |
-| `APPROVED_ACCOUNTS` | ingester | the steward DID from the contracts |
+| `APPROVED_ACCOUNTS` | ingester | the steward, `did:plc:kd5s7zyp7nje43ievnqhgzrr` |
 | `RATE_LIMIT_PER_MINUTE`, `PAGING_SESSIONS_PER_HOUR` | query | 120, 60 |
 | `SERVICE_ID` | query | `query.iriai.app` |
 

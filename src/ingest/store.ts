@@ -38,9 +38,11 @@ function eventUriOf(collection: string, value: Record<string, unknown> | undefin
 }
 
 /**
- * Applies one create, update or delete. Returns false when the stored state
- * is already at a newer repository revision (a replay or a late, older
- * change), so nothing changed. Revisions are TIDs and compare as bytes.
+ * Applies one create, update or delete. Returns false only when the stored
+ * state is at a newer repository revision (a late, older change). A replay of
+ * the revision already stored applies again and returns true, so whatever
+ * projection failed after the first write is redone. Revisions are TIDs and
+ * compare as bytes.
  */
 export async function applyChange(db: Db, change: RecordChange): Promise<boolean> {
   const uri = recordUri(change.did, change.collection, change.rkey)
@@ -51,7 +53,7 @@ export async function applyChange(db: Db, change: RecordChange): Promise<boolean
      on conflict (uri) do update set
        cid = excluded.cid, rev = excluded.rev, value = excluded.value, deleted = excluded.deleted,
        event_uri = excluded.event_uri, updated_at = now()
-     where records.rev is null or (excluded.rev is not null and records.rev < excluded.rev)`,
+     where records.rev is null or (excluded.rev is not null and records.rev <= excluded.rev)`,
     [
       uri,
       change.did,
@@ -142,19 +144,61 @@ export async function knownDids(db: Db): Promise<string[]> {
   return res.rows.map((r) => r.did)
 }
 
-export async function isAccountActive(db: Db, did: string): Promise<boolean> {
-  const res = await db.query<{ active: boolean }>('select active from accounts where did = $1', [did])
-  return res.rows[0]?.active ?? true
+/**
+ * Whether an account's events may be served: it is active, and any rebuild
+ * owed since it was last inactive has succeeded. Unknown accounts are.
+ */
+export async function isAccountServable(db: Db, did: string): Promise<boolean> {
+  const res = await db.query<{ servable: boolean }>('select active and not needs_rebuild as servable from accounts where did = $1', [did])
+  return res.rows[0]?.servable ?? true
 }
 
+/**
+ * Stores an account event. Going inactive marks the account as owing a
+ * rebuild, which only a successful rebuild clears. Returns whether the
+ * active flag changed.
+ */
 export async function setAccountStatus(db: Db, did: string, active: boolean, status: string | null): Promise<boolean> {
-  const before = await isAccountActive(db, did)
-  await db.query(
-    `insert into accounts (did, active, status, updated_at) values ($1, $2, $3, now())
-     on conflict (did) do update set active = excluded.active, status = excluded.status, updated_at = now()`,
+  const res = await db.query<{ was_active: boolean | null }>(
+    `with before as (select active from accounts where did = $1)
+     insert into accounts (did, active, status, needs_rebuild, updated_at) values ($1, $2, $3, not $2, now())
+     on conflict (did) do update set active = excluded.active, status = excluded.status,
+       needs_rebuild = accounts.needs_rebuild or not excluded.active, updated_at = now()
+     returning (select active from before) as was_active`,
     [did, active, status],
   )
-  return before !== active
+  return (res.rows[0]?.was_active ?? true) !== active
+}
+
+export async function needsRebuild(db: Db, did: string): Promise<boolean> {
+  const res = await db.query<{ needs_rebuild: boolean }>('select needs_rebuild from accounts where did = $1', [did])
+  return res.rows[0]?.needs_rebuild ?? false
+}
+
+/** Clears the owed rebuild after a successful one, if the account is still active. */
+export async function markRebuilt(db: Db, did: string): Promise<void> {
+  await db.query('update accounts set needs_rebuild = false, updated_at = now() where did = $1 and active', [did])
+}
+
+export async function accountsAwaitingRebuild(db: Db, limit: number): Promise<string[]> {
+  const res = await db.query<{ did: string }>(
+    'select did from accounts where active and needs_rebuild order by updated_at limit $1',
+    [limit],
+  )
+  return res.rows.map((r) => r.did)
+}
+
+export async function recordSkippedEvent(
+  db: Db,
+  evt: { time_us: number; did: string; kind: string },
+  error: string,
+  attempts: number,
+): Promise<void> {
+  await db.query(
+    `insert into skipped_events (time_us, did, kind, event, error, attempts) values ($1, $2, $3, $4, $5, $6)
+     on conflict (time_us) do update set error = excluded.error, attempts = excluded.attempts, skipped_at = now()`,
+    [evt.time_us, evt.did, evt.kind, JSON.stringify(evt), error.replaceAll('\u0000', ''), attempts],
+  )
 }
 
 export async function setIndexState(

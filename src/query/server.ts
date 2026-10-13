@@ -51,7 +51,10 @@ export function createQueryServer(deps: ServerDeps) {
 
       const wait = limits.request(caller)
       if (wait > 0) throw new XrpcError(429, 'RateLimitExceeded', 'too many requests; slow down', wait)
-      const q: QueryDeps = { ...deps, openSession: () => limits.openSession(caller) }
+      const q: QueryDeps = {
+        ...deps,
+        sessions: { wait: () => limits.sessionWait(caller), opened: () => limits.sessionOpened(caller) },
+      }
       switch (url.pathname) {
         case `/xrpc/${ns}.getEvent`:
           return send(res, 200, await getEvent(q, url.searchParams.get('uri')))
@@ -95,6 +98,14 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
         }
       : { lastAppliedAt: null }
     out.sidecars = Object.fromEntries(counts.rows.map((r) => [r.complete ? 'complete' : r.reason ?? 'incomplete', Number(r.n)]))
+    const accounts = await deps.db.query<{ inactive: string; awaiting_rebuild: string }>(
+      `select count(*) filter (where not active) as inactive,
+              count(*) filter (where active and needs_rebuild) as awaiting_rebuild
+       from accounts`,
+    )
+    out.accounts = { inactive: Number(accounts.rows[0].inactive), awaitingRebuild: Number(accounts.rows[0].awaiting_rebuild) }
+    const skipped = await deps.db.query<{ n: string }>('select count(*) as n from skipped_events')
+    out.skippedEvents = Number(skipped.rows[0].n)
   } catch {
     out.database = 'unavailable'
   }
@@ -107,11 +118,16 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   return { ...out, ...(deps.health?.() ?? {}) }
 }
 
-/** The first X-Forwarded-For hop (Railway's edge sets it), else the socket address. */
+/**
+ * The caller's address as Railway's edge reports it in X-Real-IP, else the
+ * socket address. Not X-Forwarded-For, whose first hop a client can write
+ * itself. query.iriai.app is DNS-only on Cloudflare, so the edge sees callers
+ * directly; proxying it through Cloudflare would make every caller one of
+ * Cloudflare's addresses here.
+ */
 function callerOf(req: IncomingMessage): string {
-  const fwd = req.headers['x-forwarded-for']
-  const first = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(',')[0]?.trim()
-  return first || req.socket.remoteAddress || 'unknown'
+  const real = req.headers['x-real-ip']
+  return (Array.isArray(real) ? real[0] : real)?.trim() || req.socket.remoteAddress || 'unknown'
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {

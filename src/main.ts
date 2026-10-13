@@ -10,11 +10,11 @@ import { loadSettings } from './settings.js'
 // the index; ROLE=query serves getEvent and queryEvents. ROLE=all runs both
 // in one process for local work.
 const settings = loadSettings()
-const db = connect(settings.databaseUrl)
-const es = connectElastic(settings.elasticUrl)
 const log = (msg: string) => console.log(`[${settings.role}] ${msg}`)
+const db = connect(settings.databaseUrl, log)
+const es = connectElastic(settings.elasticUrl)
 
-await migrate(db)
+await waitFor('PostgreSQL', () => migrate(db))
 await waitFor('Elasticsearch', () => ensureIndex(es, settings.elasticIndex))
 
 let ingester: Ingester | undefined
@@ -24,12 +24,15 @@ if (settings.role !== 'query') {
   await ingester.start()
 }
 
-const ingestionHealth = () => (ingester ? { ingester: ingester.status } : {})
+const ingestionHealth = () => (ingester ? { ingester: { healthy: ingester.healthy, ...ingester.status } } : {})
 const server =
   settings.role === 'ingester'
     ? createServer((_req, res) => {
+        // 503 once the stream has been down for a minute, so a monitor sees it.
+        const ok = ingester!.healthy
+        res.statusCode = ok ? 200 : 503
         res.setHeader('content-type', 'application/json')
-        res.end(JSON.stringify({ ok: true, ...ingestionHealth() }))
+        res.end(JSON.stringify({ ok, ...ingestionHealth() }))
       })
     : createQueryServer({ db, es, index: settings.elasticIndex, ...settings, health: ingestionHealth })
 server.listen(settings.port, () => log(`listening on ${settings.port}`))
@@ -44,15 +47,15 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   })
 }
 
+/** Waits for a dependency at start-up for as long as it takes, rather than crash-looping. */
 async function waitFor(name: string, fn: () => Promise<unknown>): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
       await fn()
       return
     } catch (err) {
-      if (attempt >= 30) throw err
       log(`${name} not ready (${(err as Error).message}); retrying`)
-      await new Promise((r) => setTimeout(r, 2_000))
+      await new Promise((r) => setTimeout(r, Math.min(10_000, 1_000 * attempt)))
     }
   }
 }

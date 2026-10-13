@@ -7,7 +7,8 @@ import { NotFound, fetchRecord, listRecords, resolvePds } from './pds.js'
 import {
   applyChange,
   getRecord,
-  isAccountActive,
+  isAccountServable,
+  markRebuilt,
   replaceAccountRecords,
   setIndexState,
   sidecarsFor,
@@ -49,8 +50,8 @@ export class Projector {
     const { db, es, index } = this.deps
     const sidecar = await getRecord(db, uri)
     const event = sidecar?.event_uri ? await getRecord(db, sidecar.event_uri) : undefined
-    const active = sidecar ? await isAccountActive(db, sidecar.did) : true
-    const result = assemble(sidecar, event, active)
+    const servable = sidecar ? await isAccountServable(db, sidecar.did) : true
+    const result = assemble(sidecar, event, servable)
     const did = sidecar?.did ?? new AtUri(uri).host
 
     if (result.complete) {
@@ -88,7 +89,11 @@ export class Projector {
     }
   }
 
-  /** Lists an account's PlaceProto records from its PDS and rebuilds its index entries. */
+  /**
+   * Lists an account's PlaceProto records from its PDS, replaces the stored
+   * ones, clears any rebuild the account owed, and rebuilds its index entries.
+   * Throws, changing nothing, when the PDS cannot be listed.
+   */
   async rebuildAccount(did: string): Promise<number> {
     const pds = await resolvePds(this.deps.db, this.deps.plcUrl, did)
     const listed = []
@@ -98,6 +103,7 @@ export class Projector {
       }
     }
     await replaceAccountRecords(this.deps.db, did, COLLECTIONS, listed)
+    await markRebuilt(this.deps.db, did)
     await this.projectAccount(did)
     return listed.length
   }

@@ -12,12 +12,16 @@ describe('per-caller limits', () => {
     assert.equal(l.request('a', t + 50_000), 0)
   })
 
-  it('cap new paging sessions per hour', () => {
+  it('cap paging sessions per hour, counting only answers that returned a cursor', () => {
     const l = new Limits(100, 2)
     const t = 1_800_000_000_000
-    assert.equal(l.openSession('a', t), 0)
-    assert.equal(l.openSession('a', t + 1000), 0)
-    assert.equal(l.openSession('a', t + 2000), 3598)
-    assert.equal(l.openSession('a', t + 3_600_001), 0)
+    // Any number of one-page answers leave the allowance untouched.
+    for (let i = 0; i < 5; i++) assert.equal(l.sessionWait('a', t), 0)
+    l.sessionOpened('a', t)
+    assert.equal(l.sessionWait('a', t + 1000), 0)
+    l.sessionOpened('a', t + 1000)
+    assert.equal(l.sessionWait('a', t + 2000), 3598)
+    assert.equal(l.sessionWait('b', t + 2000), 0)
+    assert.equal(l.sessionWait('a', t + 3_600_001), 0)
   })
 })
