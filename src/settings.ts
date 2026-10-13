@@ -1,4 +1,5 @@
-import { config } from './contracts/contracts.js'
+/** events.iriai.app, the steward account that publishes the seed events (BUILD-006). */
+export const STEWARD_DID = 'did:plc:kd5s7zyp7nje43ievnqhgzrr'
 
 export type Role = 'ingester' | 'query' | 'all'
 
@@ -36,7 +37,7 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
     elasticIndex: env.ELASTICSEARCH_INDEX ?? 'placeproto-events-v1',
     jetstreamUrl: env.JETSTREAM_URL ?? 'wss://jetstream2.us-east.bsky.network/subscribe',
     jetstreamStartCursor: env.JETSTREAM_START_CURSOR ? Number(env.JETSTREAM_START_CURSOR) : undefined,
-    approvedAccounts: (env.APPROVED_ACCOUNTS ?? config.steward.did).split(',').map((s) => s.trim()).filter(Boolean),
+    approvedAccounts: (env.APPROVED_ACCOUNTS ?? STEWARD_DID).split(',').map((s) => s.trim()).filter(Boolean),
     plcUrl: env.PLC_URL ?? 'https://plc.directory',
     serviceId: env.SERVICE_ID ?? 'query.iriai.app',
     cursorKey,

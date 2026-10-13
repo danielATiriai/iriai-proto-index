@@ -15,7 +15,6 @@ export const contractsRoot = fileURLToPath(new URL('../../../contracts/', import
 export interface ProtoConfig {
   namespace: string
   publisher: { handle: string; did: string; authorityRecord: string }
-  steward: { handle: string; did: string }
   communityEventCollection: string
 }
 
