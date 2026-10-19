@@ -82,4 +82,21 @@ It also runs this recipe as two runs of 300 record changes, the second resuming 
 
 ## Spike 3 results
 
-Pending the first run of the Stream check workflow.
+Run of 2026-10-19 at 20:32 UTC, on commit `0f6e1ca` ([run](https://github.com/danielATiriai/iriai-proto-index/actions/runs/39320070764)). Every check passed on both hosts.
+
+| | v2 (recipe host) | v1 (ingester host) |
+|---|---|---|
+| Resume method | last handled `seq` | last handled `time_us` minus 5 s, as the ingester does |
+| Cursor 35 h back | resumed at the asked time (0.0 min off) | same |
+| Oldest point replayed | about 38.5 h back (floor 2026-10-18 06:03:37 UTC) | same floor |
+| Stop 90 s, then resume (`app.bsky.graph.follow`) | 8,698 events either way; 0 missing, 0 extra | 9,062 events either way; 0 missing, 0 extra |
+| Already-handled events delivered again on resume | 1 (the cursor is inclusive) | 130 (the 5 s rewind) |
+| Replay of the last 10 minutes, twice | 17,641 events, identical | 18,146 events, identical |
+| Replay of the PlaceProto collections over 30 h, twice | identical | identical |
+| Positions going backwards within a connection | none | none |
+
+- **The recipe** stopped after 300 record changes and resumed from its cursor for 300 more. The two runs held exactly the 600 changes of one uninterrupted run from the same point, and none was handled twice.
+- **What the PlaceProto filter carried over 30 hours:** 1,081 creates, 1,719 updates and 33 deletes of `community.lexicon.calendar.event`, mostly from other calendar apps. There were no `app.iriai.proto.event` sidecars, because the steward's seeds date from Oct 13. So the pairing step (`getEvent`) has not yet run against a live sidecar. It will the first time a sidecar is written inside the window, for example the first Corgo quest (BUILD-017).
+- **One host, two shapes:** the v1 and v2 hosts now share one backend (same `seq` range, same floor). v1 messages still carry `kind`, `time_us` and `commit`, which the ingester reads, plus a new `cursor`. v2 wraps each event as `{"$type": "message", "payload": {…}}`, with `seq`, `time` and `witnessedAt` in the payload.
+- **The lookback** observed (about 38.5 h) is a little longer than the 36 hours Bluesky documents. The recipe relies only on the documented 36 hours.
+- **The ingester in production** has resumed from its checkpoint after each restart. Its Railway log shows "connecting to jetstream2.us-east.bsky.network from <checkpoint time>" on every redeploy since Oct 13.
