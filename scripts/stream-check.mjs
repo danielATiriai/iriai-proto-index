@@ -28,6 +28,11 @@ const LEAD_MS = Number(process.env.LEAD_MS ?? 120_000) // both readers start thi
 const RUN_MS = Number(process.env.RUN_MS ?? 60_000) // the subject reads this long before stopping
 const STOP_MS = Number(process.env.STOP_MS ?? 90_000) // and stays stopped this long
 const AFTER_MS = Number(process.env.AFTER_MS ?? 60_000) // then reads this long after restarting
+// How the restart resumes: `seq` (the recipe: the last handled position) or
+// `time` (the ingester: the last handled event's time_us minus 5 s, as
+// src/ingest/ingester.ts does).
+const RESUME_BY = process.env.RESUME_BY ?? 'seq'
+const INGESTER_REPLAY_US = 5_000_000
 const PLACEPROTO_HOURS = Number(process.env.PLACEPROTO_HOURS ?? 30)
 const REPORT = process.env.REPORT ?? 'stream-check-report.md'
 const HOUR_US = 3_600_000_000
@@ -109,7 +114,7 @@ function reader(collections, cursor, { until, maxMs = 600_000, idleMs, label } =
       quiet()
       let evt
       try {
-        sample ??= String(m.data).slice(0, 600)
+        sample ??= String(m.data)
         evt = normalize(String(m.data))
       } catch {
         return
@@ -164,7 +169,8 @@ async function stopRestart() {
   await sleep(RUN_MS)
   before.stop()
   const b = await before.done
-  const resumeFrom = b.last
+  const lastHandled = b.events.at(-1)
+  const resumeFrom = RESUME_BY === 'time' ? lastHandled.timeUs - INGESTER_REPLAY_US : b.last
   note(`subject read ${b.events.length} events, stopped at ${iso(b.events.at(-1)?.timeUs)}; stopped for ${STOP_MS / 1000} s`)
   await sleep(STOP_MS)
   const after = reader([BUSY], resumeFrom, { maxMs: deadline, label: 'subject after restart' })
@@ -177,12 +183,20 @@ async function stopRestart() {
   const hi = Math.min(c.last ?? 0, a.last ?? 0)
   const lo = Math.max(b.events[0]?.pos ?? Infinity, c.events[0]?.pos ?? Infinity)
   const cmp = compare(c.events, subject, lo, hi)
-  const overlap = a.events.filter((e) => e.pos <= resumeFrom).length
-  note(`resumed from cursor ${resumeFrom}; ${overlap} event(s) at or before it were delivered again and are dropped as duplicates`)
+  const overlap = a.events.filter((e) => e.pos <= lastHandled.pos).length
+  note(RESUME_BY === 'time'
+    ? `resumed as the ingester does, from the last handled event's time minus 5 s (cursor ${resumeFrom}, ${iso(resumeFrom)}); ${overlap} event(s) already handled were delivered again and are dropped as duplicates`
+    : `resumed from the last handled position, cursor ${resumeFrom}; ${overlap} event(s) at or before it were delivered again and are dropped as duplicates`)
   note(`compared ${cmp.a} events from the reader that never stopped with ${cmp.b} from the one that stopped and restarted, ${iso(c.events.find((e) => e.pos >= lo)?.timeUs)} to ${iso(c.events.filter((e) => e.pos <= hi).at(-1)?.timeUs)}`)
   check(cmp.missing === 0, `stop and restart lost no events (${cmp.missing} missing)`)
   check(cmp.extra === 0, `stop and restart invented no events (${cmp.extra} extra)`)
   check(b.backwards + a.backwards + c.backwards === 0, `positions never went backwards within a connection`)
+  if (c.sample) {
+    const m = JSON.parse(c.sample)
+    const p = m.payload ?? m
+    note(`message fields: ${Object.keys(m).join(', ')}${m.payload ? `; payload: ${Object.keys(p).join(', ')}` : ''}`)
+    if (!v2) check(typeof p.time_us === 'number' && p.kind && (p.commit || p.kind !== 'commit'), `v1 messages still carry kind, time_us and commit, which the ingester reads`)
+  }
   return c.sample
 }
 
@@ -207,13 +221,13 @@ results.push(`### ${HOST} (${v2 ? 'Jetstream v2' : 'Jetstream v1'})`, '', `Start
 try {
   results.push('**Lookback**')
   await lookback()
-  results.push('', `**Stop and restart** (${BUSY}; read ${RUN_MS / 1000} s, stopped ${STOP_MS / 1000} s, read ${AFTER_MS / 1000} s)`)
+  results.push('', `**Stop and restart** (${BUSY}; resume by ${RESUME_BY}; read ${RUN_MS / 1000} s, stopped ${STOP_MS / 1000} s, read ${AFTER_MS / 1000} s)`)
   const sample = await stopRestart()
   results.push('', '**Replay**')
   await replay([BUSY], nowUs() - 10 * 60_000_000, `${BUSY}, last 10 minutes`)
   const n = await replay(PLACEPROTO, nowUs() - PLACEPROTO_HOURS * HOUR_US, `PlaceProto collections, last ${PLACEPROTO_HOURS} hours`)
   if (n === 0) note('no PlaceProto commits in that window, so this part shows the filter only')
-  results.push('', '<details><summary>First raw message</summary>', '', '```json', sample ?? '(none)', '```', '</details>')
+  results.push('', '<details><summary>First raw message</summary>', '', '```json', sample?.slice(0, 1500) ?? '(none)', '```', '</details>')
 } catch (err) {
   check(false, `check crashed: ${err.stack ?? err}`)
 }

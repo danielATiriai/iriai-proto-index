@@ -6,6 +6,8 @@
 //   node scripts/stream-recipe.mjs                 # live from now, or resume
 //   node scripts/stream-recipe.mjs --since 24h     # first run: start 24 hours back
 //   node scripts/stream-recipe.mjs --for 60s       # stop after a minute
+//   node scripts/stream-recipe.mjs --max 100       # stop after 100 record changes
+//   node scripts/stream-recipe.mjs --cursor <seq>  # start from an explicit cursor
 //
 // Node 22 or later, no dependencies. The cursor is kept in .placeproto-cursor
 // (CURSOR_FILE). Jetstream replays the last 36 hours from a saved cursor with
@@ -21,7 +23,7 @@ const LOOKBACK_US = 36 * 3_600_000_000
 const arg = (name) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : undefined }
 const duration = (s) => s && Number(s.slice(0, -1)) * { s: 1e3, m: 6e4, h: 3.6e6 }[s.at(-1)]
 
-// 1. Where to start: the saved cursor, else --since, else live.
+// 1. Where to start: the saved cursor, else --cursor or --since, else live.
 const saved = existsSync(CURSOR_FILE) ? JSON.parse(readFileSync(CURSOR_FILE, 'utf8')) : undefined
 let cursor = saved?.cursor
 if (saved && Date.now() * 1000 - saved.timeUs > LOOKBACK_US) {
@@ -29,6 +31,7 @@ if (saved && Date.now() * 1000 - saved.timeUs > LOOKBACK_US) {
   console.error('Resync what you need from the query API (queryEvents), delete the cursor file, and start again.')
   process.exit(1)
 }
+if (cursor === undefined && arg('--cursor')) cursor = Number(arg('--cursor'))
 if (cursor === undefined && arg('--since')) cursor = (Date.now() - duration(arg('--since'))) * 1000 // a time in µs is accepted as a cursor
 
 // 2. Subscribe to the two PlaceProto record types only.
@@ -42,6 +45,11 @@ const ws = new WebSocket(url, ['xrpc.v1.json'])
 // at least once, so anything at or before the last handled position (the saved
 // cursor, after a restart) is skipped. Positions only grow.
 let last = saved
+// Account events arrive for the whole network; only those for authors seen
+// writing PlaceProto records matter here. A real consumer keeps this in its store.
+const authors = new Set()
+const max = Number(arg('--max') ?? Infinity)
+let handled = 0
 let queue = Promise.resolve()
 ws.addEventListener('message', (m) => { queue = queue.then(() => onMessage(m.data)) })
 async function onMessage(data) {
@@ -49,12 +57,14 @@ async function onMessage(data) {
   const e = msg.payload ?? msg
   const kind = e.kind ?? e.$type?.split('#')[1]
   const seq = Number(e.seq ?? e.cursor ?? e.time_us)
-  if (last && seq <= last.cursor) return
+  if ((last && seq <= last.cursor) || handled >= max) return
   const timeUs = e.time_us ?? (e.time ? Date.parse(e.time) * 1000 : Date.now() * 1000)
   if (kind === 'commit') {
     const c = e.commit ?? e
-    await handle(c.operation, c.collection, `at://${e.did}/${c.collection}/${c.rkey}`, c.record)
-  } else if (kind === 'account' && (e.account ?? e).active === false) {
+    authors.add(e.did)
+    await handle(seq, c.operation, c.collection, `at://${e.did}/${c.collection}/${c.rkey}`, c.record)
+    if (++handled >= max) stop()
+  } else if (kind === 'account' && authors.has(e.did) && (e.account ?? e).active === false) {
     console.log(`account ${e.did} is ${(e.account ?? e).status ?? 'inactive'}: hide its events`)
   }
   last = { cursor: seq, timeUs }
@@ -63,17 +73,17 @@ async function onMessage(data) {
 // 4. Pair a sidecar with its event. A sidecar names its event by eventUri in
 // the same repository; the query API returns the complete pair (or 404 until
 // both records exist and the index has caught up, usually seconds).
-async function handle(operation, collection, uri, record) {
-  const when = new Date().toISOString().slice(11, 19)
+async function handle(seq, operation, collection, uri, record) {
+  const when = `#${seq} ${new Date().toISOString().slice(11, 19)}`
   if (operation === 'delete') return console.log(`${when} deleted ${uri}`)
   if (collection === 'community.lexicon.calendar.event') return console.log(`${when} ${operation} event "${record?.name}" ${uri}`)
   console.log(`${when} ${operation} sidecar ${uri} for ${record?.eventUri} at ${record?.location?.name ?? record?.location?.$type}`)
   try {
     const res = await fetch(`${QUERY}/xrpc/app.iriai.proto.getEvent?uri=${encodeURIComponent(uri)}`, { signal: AbortSignal.timeout(10_000) })
     const body = await res.json()
-    console.log(res.ok ? `         paired: "${body.event?.record?.name ?? body.event?.name ?? '?'}"` : `         not paired yet: ${body.error}`)
+    console.log(res.ok ? `    paired: "${body.event?.record?.name ?? body.event?.name ?? '?'}"` : `    not paired yet: ${body.error}`)
   } catch (err) {
-    console.log(`         query API unreachable: ${err.message}`)
+    console.log(`    query API unreachable: ${err.message}`)
   }
 }
 

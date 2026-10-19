@@ -24,12 +24,12 @@ node scripts/stream-recipe.mjs --since 24h   # first run: everything from the la
 node scripts/stream-recipe.mjs               # later runs: resume from the saved cursor
 ```
 
-It prints each change as it arrives. For a sidecar it also asks the query API for the complete pair:
+It prints each change as it arrives, starting with its position in the stream (`seq`). For a sidecar it also asks the query API for the complete pair. Account events arrive for the whole network whatever the filter, so it only reports one for an author it has seen write a PlaceProto record:
 
 ```
-20:41:07 create event "Taiko evening" at://did:plc:…/community.lexicon.calendar.event/3mxr…
-20:41:07 create sidecar at://did:plc:…/app.iriai.proto.event/3mxr… for at://did:plc:…/community.lexicon.calendar.event/3mxr… at Japantown Peace Plaza
-         paired: "Taiko evening"
+#26211145361 20:41:07 create event "Taiko evening" at://did:plc:…/community.lexicon.calendar.event/3mxr…
+#26211145362 20:41:07 create sidecar at://did:plc:…/app.iriai.proto.event/3mxr… for at://did:plc:…/community.lexicon.calendar.event/3mxr… at Japantown Peace Plaza
+    paired: "Taiko evening"
 ```
 
 The connection it opens is:
@@ -76,7 +76,9 @@ The **Stream check** workflow (`.github/workflows/stream-check.yml`, spike 3 of 
 - Reading the same stretch twice gives the same events, for a busy collection and for the PlaceProto collections over the last 30 hours.
 - Positions never go backwards within a connection.
 
-It also runs this recipe twice, the second run resuming from the first run's cursor, and fails if the second run handles anything the first already did. Results: see [Spike 3 results](#spike-3-results).
+The v2 job resumes from the last handled `seq`, as this recipe does. The v1 job resumes the way the Iriai ingester does, from the last handled event's `time_us` minus 5 seconds (`src/ingest/ingester.ts`), and also checks that v1 messages still carry the fields the ingester reads.
+
+It also runs this recipe as two runs of 300 record changes, the second resuming from the first one's cursor, and checks that together they hold exactly the 600 changes of one uninterrupted run from the same point, none handled twice. Results: see [Spike 3 results](#spike-3-results).
 
 ## Spike 3 results
 

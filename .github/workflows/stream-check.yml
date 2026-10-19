@@ -25,10 +25,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: v2, recipe host
+          - name: v2, recipe host, resume by seq
             host: wss://jetstream.us-east.bsky.network
-          - name: v1, ingester host
+            resume: seq
+          - name: v1, ingester host, resume by time as the ingester does
             host: wss://jetstream2.us-east.bsky.network/subscribe
+            resume: time
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -37,6 +39,7 @@ jobs:
       - run: node scripts/stream-check.mjs "${{ matrix.host }}"
         env:
           REPORT: stream-check-report.md
+          RESUME_BY: ${{ matrix.resume }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -52,26 +55,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: First run, from 30 hours back, for two minutes
-        run: node scripts/stream-recipe.mjs --since 30h --for 120s | tee first.txt
-      - name: Second run resumes from the saved cursor
+      # Two runs that stop after 300 record changes each, the second resuming
+      # from the first one's cursor, against one uninterrupted run of 600 from
+      # the same starting point. Each printed change starts with its seq.
+      - name: Stopped and resumed, against one uninterrupted run
         run: |
-          cat .placeproto-cursor
-          node scripts/stream-recipe.mjs --for 30s | tee second.txt
-      - name: Summary
-        run: |
+          start=$(( ($(date +%s) - 30*3600) * 1000000 ))
+          node scripts/stream-recipe.mjs --cursor "$start" --max 300 | tee first.txt
+          node scripts/stream-recipe.mjs --max 300 | tee second.txt
+          CURSOR_FILE=.control-cursor node scripts/stream-recipe.mjs --cursor "$start" --max 600 > control.txt
+          seqs() { grep -o '^#[0-9]*' "$1" | sort -u; }
+          seqs first.txt > a; seqs second.txt > b; seqs control.txt > c
+          echo "first $(wc -l < a), second $(wc -l < b), uninterrupted $(wc -l < c) changes; handled twice: $(comm -12 a b | wc -l)"
+          [ -s a ] && [ -s b ] || { echo "::error::a run handled no record changes, so nothing was compared"; exit 1; }
+          [ "$(comm -12 a b | wc -l)" -eq 0 ] || { echo "::error::the resumed run handled changes the first run already handled"; exit 1; }
+          diff <(sort -u a b) c > gap.txt || { echo "::error::stopping and resuming did not give the same changes as one uninterrupted run"; cat gap.txt; exit 1; }
           {
             echo "### Recipe"
             echo
-            echo "First run: $(grep -c ' create \| update \| deleted ' first.txt || true) PlaceProto changes from the last 30 hours. Second run: $(grep -c ' create \| update \| deleted ' second.txt || true), none of them repeats."
+            echo "Two runs of 300 record changes, the second resuming from the first one's cursor, gave exactly the 600 changes of one uninterrupted run from the same point, none handled twice."
             echo
             echo '```'
             head -c 6000 first.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          # Nothing the first run handled may come back in the second.
-          sort first.txt | grep ' at://' > a.txt || true
-          sort second.txt | grep ' at://' > b.txt || true
-          if [ -s b.txt ] && comm -12 <(cut -c10- a.txt | sort) <(cut -c10- b.txt | sort) | grep -q .; then
-            echo "::error::the resumed run handled an event the first run already handled"; exit 1
-          fi
