@@ -41,7 +41,7 @@ wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents
   &cursor=<last seq you handled>
 ```
 
-Each message is `{"$type": "message", "payload": {…}}`. A commit payload carries `did`, `seq`, `time`, `operation` (`create`, `update` or `delete`), `collection`, `rkey`, `rev`, `cid` and the decoded `record`. The record's address is `at://{did}/{collection}/{rkey}`. The script also reads the older v1 shape (`wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=…`, with `time_us` as the cursor), which is what the Iriai ingester uses today.
+Each message is `{"$type": "message", "payload": {…}}`. A commit payload carries `did`, `seq`, `time`, `operation` (`create`, `update` or `delete`), `collection`, `rkey`, `rev`, `cid` and the decoded `record`. The record's address is `at://{did}/{collection}/{rkey}`. The Iriai ingester still uses the older v1 endpoint (`wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=…`, with `time_us` as the cursor). The script parses that message shape too, but it always connects to the v2 path, so point `JETSTREAM` at a v2 host.
 
 ## Resume without gaps or repeats
 
@@ -54,7 +54,7 @@ Each message is `{"$type": "message", "payload": {…}}`. A commit payload carri
 
 The stream gives you records one at a time. A useful PlaceProto event needs both: the community event (name, times, description) and the sidecar (where it is). Three ways to pair them:
 
-- **Ask the query API (simplest).** `GET https://query.iriai.app/xrpc/app.iriai.proto.getEvent?uri=<sidecar AT-URI>` returns the complete pair as one `eventView`. Use `queryEvents?eventUri=<event AT-URI>` to go from an event to its sidecar. A pair the index has not caught up with yet answers `404 SidecarNotFound` for a few seconds, so retry.
+- **Ask the query API (simplest).** `GET https://query.iriai.app/xrpc/app.iriai.proto.getEvent?uri=<sidecar AT-URI>` returns the complete pair as `{ value, version }`, where `value` is one `eventView` (`value.event` is the community event, `value.uri` the sidecar, `value.location` its place). Use `queryEvents?eventUri=<event AT-URI>` to go from an event to its sidecar. A pair the index has not caught up with yet answers `404 SidecarNotFound` for a few seconds, so retry.
 - **Keep both yourself.** Store events by AT-URI and sidecars by their `eventUri`, and treat an event as PlaceProto once both are present. The sidecar can arrive first.
 - **Fetch the missing half from the author's PDS.** `com.atproto.repo.getRecord` on the author's PDS (from their DID document) returns the other record if it predates your cursor.
 

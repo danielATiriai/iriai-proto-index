@@ -81,7 +81,7 @@ async function handle(seq, operation, collection, uri, record) {
   try {
     const res = await fetch(`${QUERY}/xrpc/app.iriai.proto.getEvent?uri=${encodeURIComponent(uri)}`, { signal: AbortSignal.timeout(10_000) })
     const body = await res.json()
-    console.log(res.ok ? `    paired: "${body.event?.record?.name ?? body.event?.name ?? '?'}"` : `    not paired yet: ${body.error}`)
+    console.log(res.ok ? `    paired: "${body.value?.event?.name ?? '?'}"` : `    not paired yet: ${body.error}`)
   } catch (err) {
     console.log(`    query API unreachable: ${err.message}`)
   }
