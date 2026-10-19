@@ -1,0 +1,77 @@
+name: Stream check
+
+# Spike 3 (BUILD-012, D-12): stop, restart and replay on Bluesky's public
+# Jetstream, on the v2 host the developer recipe uses and the v1 host the
+# ingester uses, then the recipe itself run twice so the second run resumes
+# from the first one's cursor. Cloud threads cannot reach Jetstream, so this
+# runs here. Reports are attached to the run and shown in its summary.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/stream-check.mjs
+      - scripts/stream-recipe.mjs
+      - .github/workflows/stream-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Stop, restart and replay (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: v2, recipe host
+            host: wss://jetstream.us-east.bsky.network
+          - name: v1, ingester host
+            host: wss://jetstream2.us-east.bsky.network/subscribe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/stream-check.mjs "${{ matrix.host }}"
+        env:
+          REPORT: stream-check-report.md
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-check-${{ strategy.job-index }}
+          path: stream-check-report.md
+
+  recipe:
+    name: Recipe, stopped and resumed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: First run, from 30 hours back, for two minutes
+        run: node scripts/stream-recipe.mjs --since 30h --for 120s | tee first.txt
+      - name: Second run resumes from the saved cursor
+        run: |
+          cat .placeproto-cursor
+          node scripts/stream-recipe.mjs --for 30s | tee second.txt
+      - name: Summary
+        run: |
+          {
+            echo "### Recipe"
+            echo
+            echo "First run: $(grep -c ' create \| update \| deleted ' first.txt || true) PlaceProto changes from the last 30 hours. Second run: $(grep -c ' create \| update \| deleted ' second.txt || true), none of them repeats."
+            echo
+            echo '```'
+            head -c 6000 first.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Nothing the first run handled may come back in the second.
+          sort first.txt | grep ' at://' > a.txt || true
+          sort second.txt | grep ' at://' > b.txt || true
+          if [ -s b.txt ] && comm -12 <(cut -c10- a.txt | sort) <(cut -c10- b.txt | sort) | grep -q .; then
+            echo "::error::the resumed run handled an event the first run already handled"; exit 1
+          fi
