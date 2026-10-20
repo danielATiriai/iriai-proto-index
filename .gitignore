@@ -1,3 +1,5 @@
 node_modules/
 dist/
 .tmp/
+.placeproto-cursor
+stream-check-report.md

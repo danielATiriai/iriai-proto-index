@@ -1,0 +1,81 @@
+name: Stream check
+
+# Spike 3 (BUILD-012, D-12): stop, restart and replay on Bluesky's public
+# Jetstream, on the v2 host the developer recipe uses and the v1 host the
+# ingester uses, then the recipe itself run twice so the second run resumes
+# from the first one's cursor. Cloud threads cannot reach Jetstream, so this
+# runs here. Reports are attached to the run and shown in its summary.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/stream-check.mjs
+      - scripts/stream-recipe.mjs
+      - .github/workflows/stream-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Stop, restart and replay (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: v2, recipe host, resume by seq
+            host: wss://jetstream.us-east.bsky.network
+            resume: seq
+          - name: v1, ingester host, resume by time as the ingester does
+            host: wss://jetstream2.us-east.bsky.network/subscribe
+            resume: time
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/stream-check.mjs "${{ matrix.host }}"
+        env:
+          REPORT: stream-check-report.md
+          RESUME_BY: ${{ matrix.resume }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-check-${{ strategy.job-index }}
+          path: stream-check-report.md
+
+  recipe:
+    name: Recipe, stopped and resumed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Two runs that stop after 300 record changes each, the second resuming
+      # from the first one's cursor, against one uninterrupted run of 600 from
+      # the same starting point. Each printed change starts with its seq.
+      - name: Stopped and resumed, against one uninterrupted run
+        run: |
+          start=$(( ($(date +%s) - 30*3600) * 1000000 ))
+          node scripts/stream-recipe.mjs --cursor "$start" --max 300 | tee first.txt
+          node scripts/stream-recipe.mjs --max 300 | tee second.txt
+          CURSOR_FILE=.control-cursor node scripts/stream-recipe.mjs --cursor "$start" --max 600 > control.txt
+          seqs() { grep -o '^#[0-9]*' "$1" | sort -u; }
+          seqs first.txt > a; seqs second.txt > b; seqs control.txt > c
+          echo "first $(wc -l < a), second $(wc -l < b), uninterrupted $(wc -l < c) changes; handled twice: $(comm -12 a b | wc -l)"
+          [ -s a ] && [ -s b ] || { echo "::error::a run handled no record changes, so nothing was compared"; exit 1; }
+          [ "$(comm -12 a b | wc -l)" -eq 0 ] || { echo "::error::the resumed run handled changes the first run already handled"; exit 1; }
+          diff <(sort -u a b) c > gap.txt || { echo "::error::stopping and resuming did not give the same changes as one uninterrupted run"; cat gap.txt; exit 1; }
+          {
+            echo "### Recipe"
+            echo
+            echo "Two runs of 300 record changes, the second resuming from the first one's cursor, gave exactly the 600 changes of one uninterrupted run from the same point, none handled twice."
+            echo
+            echo '```'
+            head -c 6000 first.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

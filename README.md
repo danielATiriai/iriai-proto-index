@@ -24,6 +24,10 @@ GET /xrpc/_health
 
 The method lexicons (`getEvent`, `queryEvents`) are published in contracts v0.2.0 (BUILD-013). This service answers the shapes in the specification.
 
+## Change stream
+
+Iriai runs no stream of its own in YC (D-13). To follow PlaceProto events as they are written, read Bluesky's public Jetstream filtered to the two PlaceProto collections: the [stream recipe](docs/stream-recipe.md) explains how, with a runnable script (`node scripts/stream-recipe.mjs`) that resumes from a saved cursor inside Jetstream's 36-hour lookback. The planned Iriai-hosted feed is described, with no numbers committed, in [Iriai change feed (coming soon)](docs/change-feed.md). The **Stream check** workflow (spike 3) proves stop, restart and replay on the public stream.
+
 ## How it works
 
 - **Ingester** (`ROLE=ingester`) subscribes to Jetstream for `community.lexicon.calendar.event` and `app.iriai.proto.event` only. Posts are fetched on demand later, never streamed (D-12). Events are handled in order, and the cursor is checkpointed only after handling. A record is never replaced by an older repository revision, and a replay of the same revision is applied and projected again, so whatever failed the first time is redone. Each change is re-assembled into complete pairs:
@@ -59,6 +63,7 @@ npm test                                   # unit tests
 TEST_DATABASE_URL=postgres://… TEST_ELASTICSEARCH_URL=http://localhost:9200 npm test   # everything, as CI runs it
 npm run check-contracts                    # vendored contracts match the v0.1.0 release
 node scripts/acceptance.mjs [base URL]     # live check of a deployed query service
+node scripts/stream-check.mjs [host]       # spike 3: stop, restart and replay on public Jetstream
 ```
 
 The **Acceptance** workflow runs the live check from GitHub against `https://query.iriai.app` (or another URL): it lists every sidecar the steward has published from its PDS, then checks that queryEvents near Peace Plaza returns exactly those events, nearest first and earliest first, a few per page, and that getEvent and the health report answer.
