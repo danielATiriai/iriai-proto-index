@@ -1,0 +1,9 @@
+{
+  "product": "proto-index",
+  "name": "PlaceProto query index",
+  "services": ["proto-index.query", "proto-index.ingester"],
+  "routes": { "xrpc": ["src/query/server.ts"] },
+  "settings": { "env": ["src/settings.ts#loadSettings"] },
+  "contracts": ["contracts"],
+  "note": "Pages for this repository are kept in the private wiki repository, so only this file lives here."
+}
