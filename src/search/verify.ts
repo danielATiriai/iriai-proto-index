@@ -10,11 +10,14 @@ export const UPKEEP_LOCK = 7140016
 
 /**
  * The ingester's search upkeep for PR 1 (spec 4.2, 5.2, 5.4), run at start-up
- * and every 10 minutes in order with event handling, so no write lands in the
- * middle of it: closed rows past 61 minutes are deleted; the first fill runs
- * until it has finished once; then the comparison with today's index runs
- * right after the fill and hourly until it passes once, which verifies
- * Postgres for good.
+ * and every 10 minutes, on one ingester at a time. Writes may land while it
+ * runs (this ingester's events wait, another's do not): each projection
+ * reads stored records under the write lock, and a write from code that does
+ * not keep event_docs moves the generation, which voids the run. Closed rows
+ * past 61 minutes are deleted; the first fill runs until it finishes at an
+ * unmoved generation; then the comparison runs right after it and hourly
+ * until it passes. Verification holds until a comparison finds a difference
+ * or the generation moves.
  */
 export class SearchUpkeep {
   constructor(
@@ -79,13 +82,17 @@ export class SearchUpkeep {
   /**
    * Projects every sidecar in index_state into Postgres, then records that
    * the first fill is done, unless code that does not write event_docs
-   * changed index_state meanwhile (the generation moved): then it runs again.
+   * changed an ingestion table meanwhile (the generation moved): then it runs again.
    */
   async firstFill(): Promise<number> {
     const { generation } = await readControl(this.db)
     const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
     for (const uri of uris) await this.projector.fillPostgres(uri)
-    const res = await this.db.query('update search_control set first_fill_done = true, updated_at = now() where id = 1 and generation = $1', [generation])
+    const res = await this.db.query(
+      `update search_control set first_fill_done = true, fill_generation = $1, pg_verified = false, compared_at = null, note = null, updated_at = now()
+       where id = 1 and search_generation_now() = $1`,
+      [generation],
+    )
     if (res.rowCount === 0) throw new Error('an ingestion table changed during the fill')
     return uris.length
   }
@@ -125,8 +132,10 @@ export class SearchUpkeep {
       note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying in an hour'
     }
     const res = await this.db.query(
-      `update search_control set pg_verified = case when $4 then $1 else pg_verified end, compared_at = now(), note = $2, updated_at = now()
-       where id = 1 and generation = $3 and first_fill_done`,
+      `update search_control
+         set pg_verified = case when $4 then $1 else pg_verified end,
+             compared_at = case when $4 then now() else compared_at end, note = $2, updated_at = now()
+       where id = 1 and first_fill_done and fill_generation = $3 and search_generation_now() = $3`,
       [ok, note, generation, ran],
     )
     if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }

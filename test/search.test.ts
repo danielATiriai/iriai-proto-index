@@ -250,7 +250,7 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     }
     return dead
   }
-  const setVerified = (v: boolean) => db.query('update search_control set pg_verified = $1', [v]).then(() => search.control.refresh())
+  const setVerified = (v: boolean) => db.query('update search_control set pg_verified = $1, fill_generation = search_generation_now()', [v]).then(() => search.control.refresh())
 
   before(async () => {
     db = await freshDb('routing_test')
@@ -589,6 +589,51 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     }
   })
 
+  it('lets two older writers change different ingestion tables at once: the trigger takes no row lock', async () => {
+    const a = new pg.Client({ connectionString: dbUrl('routing_test') })
+    const b = new pg.Client({ connectionString: dbUrl('routing_test') })
+    await a.connect()
+    await b.connect()
+    try {
+      await a.query('begin')
+      await a.query(`update accounts set active = active where did = $1`, [AUTHOR])
+      await b.query('begin')
+      const done = await Promise.race([
+        b.query(`update index_state set updated_at = updated_at where uri = $1`, [uriOf(1)]).then(() => true),
+        new Promise((r) => setTimeout(() => r(false), 2_000)),
+      ])
+      assert.equal(done, true, 'the second writer waited on the first through the trigger')
+    } finally {
+      await a.query('rollback').catch(() => {})
+      await b.query('rollback').catch(() => {})
+      await a.end()
+      await b.end()
+    }
+    // Verification is void at the moved generation, as it should be.
+    assert.equal((await readControl(db)).pgVerified, false)
+    await db.query('update search_control set fill_generation = search_generation_now()')
+    await setVerified(true)
+  })
+
+  it('destroys a search_control connection that does not answer, so it cannot hold a slot', async () => {
+    const released: (Error | undefined)[] = []
+    let n = 0
+    const pool = {
+      connect: async () => {
+        const hung = n++ === 0
+        return {
+          query: (text: string, values?: unknown[]) => (hung ? new Promise(() => {}) : db.query(text, values)),
+          release: (err?: Error) => released.push(err),
+        }
+      },
+    } as unknown as Db
+    const control = new SearchControl(pool)
+    await assert.rejects(control.refresh(), /did not answer/)
+    assert.ok(released[0] instanceof Error, 'the hung connection was released with an error, so the pool destroys it')
+    await control.refresh()
+    assert.equal(released[1], undefined)
+  })
+
   it('looks at verification again before falling back to Postgres', async () => {
     await setVerified(true)
     const clearing = {
@@ -787,7 +832,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await upkeep.run()
     assert.equal((await readControl(db)).pgVerified, true)
     for (const sql of [`update accounts set active = false where did = '${AUTHOR}'`, `update records set updated_at = now() where did = '${AUTHOR}'`]) {
-      await db.query('update search_control set pg_verified = true, first_fill_done = true')
+      await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now()')
       const before = (await readControl(db)).generation
       const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
       await old.connect()
@@ -839,11 +884,21 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await holder.connect()
     await holder.query('begin')
     await holder.query('select pg_advisory_xact_lock($1)', [7140015])
-    const fill = projector.fillPostgres(s3)
-    await new Promise((r) => setTimeout(r, 200))
-    await db.query(`update records set deleted = true, value = null where uri = $1`, [s3])
-    await holder.query('commit')
-    await holder.end()
+    let fill: Promise<void> | undefined
+    try {
+      fill = projector.fillPostgres(s3)
+      // Barrier: the fill is waiting on the write lock.
+      for (let i = 0; ; i++) {
+        const waiting = await db.query(`select 1 from pg_locks where locktype = 'advisory' and objid = 7140015 and not granted`)
+        if (waiting.rowCount) break
+        if (i > 200) throw new Error('the fill never waited on the write lock')
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await db.query(`update records set deleted = true, value = null where uri = $1`, [s3])
+    } finally {
+      await holder.query('commit').catch(() => {})
+      await holder.end()
+    }
     await fill
     assert.equal(await projector.postgres.get(s3), undefined)
     // Ingester B's own projection of the delete agrees.
@@ -870,7 +925,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
   })
 
   it('leaves verification as it is when a comparison cannot run', async () => {
-    await db.query('update search_control set pg_verified = true, first_fill_done = true')
+    await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now()')
     const real = projector.elastic.allDocs.bind(projector.elastic)
     projector.elastic.allDocs = async () => Promise.reject(new Error('connect ECONNREFUSED'))
     try {
@@ -883,7 +938,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
   })
 
   it('clears verification when a comparison finds a difference, whoever set it', async () => {
-    await db.query('update search_control set pg_verified = true, first_fill_done = true, compared_at = null')
+    await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now(), compared_at = null')
     const upkeep = new SearchUpkeep(db, projector, () => {})
     const extra = { ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks1`))!, uri: `at://${AUTHOR}/${SIDECAR}/3ksextra` }
     await projector.postgres.put(extra)
@@ -933,11 +988,13 @@ describe('projector writes', { skip: !databaseUrl && 'TEST_DATABASE_URL not set'
   it('writes Postgres first, then today\'s index; an Elasticsearch failure fails the event, and the replay writes both', async () => {
     await handler.handle(commit(EVENT, '3kew1', eventValue({ name: 'first' })))
     es.down = true
-    await assert.rejects(handler.handle(commit(SIDECAR, '3ksw1', sidecarValue(AUTHOR, '3kew1', geo('37.78', '-122.43')))))
+    const failed = commit(SIDECAR, '3ksw1', sidecarValue(AUTHOR, '3kew1', geo('37.78', '-122.43')))
+    await assert.rejects(handler.handle(failed))
     assert.ok(await projector.postgres.get(sidecar), 'Postgres was written before Elasticsearch failed')
     assert.equal(es.docs.has(sidecar), false)
     es.down = false
-    await handler.handle(commit(SIDECAR, '3ksw1', sidecarValue(AUTHOR, '3kew1', geo('37.78', '-122.43'))))
+    // The replay is the same event, revision and all.
+    await handler.handle(failed)
     assert.ok(es.docs.has(sidecar))
     assert.equal(comparable((await projector.postgres.get(sidecar))!), comparable(es.docs.get(sidecar) as EventDoc))
 

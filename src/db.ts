@@ -151,22 +151,29 @@ create table if not exists search_control (
   compared_at timestamptz,
   note text,
   updated_at timestamptz not null default now(),
-  generation bigint not null default 0
+  -- The generation (search_generation) the first fill finished at. The fill
+  -- and verification count only while the generation has not moved since.
+  fill_generation bigint not null default 0
 );
+-- Moved on by every change to an ingestion table from code that does not
+-- write event_docs. A sequence, not a row: it takes no lock (so the trigger
+-- cannot deadlock writers with one another) and does not roll back.
+create sequence if not exists search_generation;
+create or replace function search_generation_now() returns bigint language sql volatile as $fn$
+  select case when is_called then last_value else 0 end from search_generation
+$fn$;
 
 -- Code that changes an ingestion table without writing event_docs (this
 -- service before search on Postgres, say after a revert) leaves event_docs
--- stale. Any such change clears the first fill and verification, so the
--- next upkeep fills event_docs again and compares before Postgres may serve.
+-- stale. Any such change moves the generation on, which voids the first
+-- fill and verification, so the next upkeep fills event_docs again and
+-- compares before Postgres may serve.
 -- Every table the ingester writes is watched, not only index_state: older
 -- code changes records or accounts first and may fail before index_state.
 create or replace function search_foreign_write() returns trigger language plpgsql as $fn$
 begin
   if coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
-    update search_control
-      set first_fill_done = false, pg_verified = false, compared_at = null, generation = generation + 1,
-          updated_at = now(), note = 'ingestion tables were changed by code that does not write event_docs; filling again'
-      where id = 1;
+    perform nextval('search_generation');
   end if;
   return null;
 end

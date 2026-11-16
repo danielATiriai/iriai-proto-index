@@ -32,12 +32,14 @@ const EXTEND_BELOW_MS = 60 * 60_000
  * read is stopped in the database too, not only no longer awaited.
  */
 export function controlPool(databaseUrl: string, log: (msg: string) => void = console.error): Db {
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 2, statement_timeout: CONTROL_MS, connectionTimeoutMillis: CONTROL_MS })
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 2, statement_timeout: CONTROL_MS, connectionTimeoutMillis: CONTROL_MS, keepAlive: true })
   pool.on('error', (err) => log(`postgres (search control): idle client lost: ${err.message}`))
   return pool
 }
 
 export async function readControl(db: Db): Promise<ControlRow> {
+  // The fill, the comparison and verification count only at the generation
+  // the fill finished at; once it moves, they read as not done.
   const res = await db.query<{
     generation: string
     elastic_cursors_until: Date
@@ -45,7 +47,15 @@ export async function readControl(db: Db): Promise<ControlRow> {
     pg_verified: boolean
     compared_at: Date | null
     note: string | null
-  }>('select generation::text, elastic_cursors_until, first_fill_done, pg_verified, compared_at, note from search_control where id = 1')
+    stale: boolean
+  }>(
+    `select g::text as generation, elastic_cursors_until,
+            first_fill_done and fill_generation = g as first_fill_done,
+            pg_verified and fill_generation = g as pg_verified,
+            case when fill_generation = g then compared_at end as compared_at,
+            note, first_fill_done and fill_generation <> g as stale
+     from search_control, search_generation_now() as g where id = 1`,
+  )
   const r = res.rows[0]
   return {
     generation: r.generation,
@@ -53,7 +63,7 @@ export async function readControl(db: Db): Promise<ControlRow> {
     firstFillDone: r.first_fill_done,
     pgVerified: r.pg_verified,
     comparedAt: r.compared_at,
-    note: r.note,
+    note: r.stale ? 'ingestion tables were changed by code that does not write event_docs; filling again' : r.note,
   }
 }
 
@@ -76,7 +86,7 @@ export class SearchControl {
   }
 
   async refresh(): Promise<ControlRow> {
-    this.row = await within(readControl(this.db))
+    this.row = await this.bounded((q) => readControl(q))
     this.readAt = this.now()
     return this.row
   }
@@ -100,14 +110,46 @@ export class SearchControl {
     const row = await this.current()
     if (row.elasticCursorsUntil.getTime() >= this.now() + EXTEND_BELOW_MS) return
     const until = new Date(this.now() + COVER_MS)
-    const res = await within(
-      this.db.query<{ elastic_cursors_until: Date }>(
+    const res = await this.bounded((q) =>
+      q.query<{ elastic_cursors_until: Date }>(
         `update search_control set elastic_cursors_until = greatest(elastic_cursors_until, $1), updated_at = now()
          where id = 1 returning elastic_cursors_until`,
         [until],
       ),
     )
     row.elasticCursorsUntil = res.rows[0].elastic_cursors_until
+  }
+
+  /**
+   * Runs `work` on a connection of its own, bounded to CONTROL_MS end to end.
+   * A connection that does not answer in time is destroyed, not returned to
+   * the pool, so a hung connection cannot hold one of its two slots; one that
+   * arrives after the wait gave up goes straight back.
+   */
+  private async bounded<R>(work: (q: Db) => Promise<R>): Promise<R> {
+    const pool = this.db as Partial<pg.Pool>
+    if (typeof pool.connect !== 'function') return within(work(this.db))
+    let gaveUp = false
+    const connecting: Promise<pg.PoolClient> = (this.db as pg.Pool).connect()
+    connecting.then(
+      (c: pg.PoolClient) => gaveUp && c.release(),
+      () => {},
+    )
+    let client: pg.PoolClient
+    try {
+      client = await within(connecting)
+    } catch (err) {
+      gaveUp = true
+      throw err
+    }
+    try {
+      const out = await within(work(client as unknown as Db))
+      client.release()
+      return out
+    } catch (err) {
+      client.release(err as Error)
+      throw err
+    }
   }
 }
 
