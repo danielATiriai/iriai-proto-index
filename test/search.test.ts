@@ -379,12 +379,40 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     assert.equal(res.value.uri, uriOf(2))
   })
 
+  /** search_control on a database whose every query stalls (or answers after `ms`). */
+  const slowControl = (ms = Infinity) =>
+    new SearchControl({
+      query: (text: string, values?: unknown[]) =>
+        ms === Infinity ? new Promise(() => {}) : new Promise((r) => setTimeout(r, ms)).then(() => db.query(text, values)),
+    } as unknown as Db)
+
   it('cuts off a stalled search_control read after 500 ms and serves getEvent from Elasticsearch', async () => {
-    const stalled = { refresh: () => new Promise(() => {}) } as unknown as SearchControl
     const started = Date.now()
-    const res = await getEvent({ ...deps, search: { ...search, control: stalled } }, uriOf(2))
+    const res = await getEvent({ ...deps, search: { ...search, control: slowControl() } }, uriOf(2))
     assert.equal(res.value.uri, uriOf(2))
     assert.ok(Date.now() - started < 1_500, `took ${Date.now() - started} ms`)
+  })
+
+  it('refuses a first page within a second, not hanging, when search_control stalls and Postgres cannot be shown verified', async () => {
+    const started = Date.now()
+    await assert.rejects(ask(PARAMS, undefined, { ...deps, search: { ...search, control: slowControl() } }), unavailable)
+    assert.ok(Date.now() - started < 1_500, `took ${Date.now() - started} ms`)
+  })
+
+  it('reports in health what routing does when search_control answers too slowly', async () => {
+    await setVerified(true)
+    const forced = { ...search, force: 'postgres' as const, control: slowControl(650) }
+    await assert.rejects(ask(PARAMS, undefined, { ...deps, search: forced }), unavailable)
+    const server = createQueryServer({ db, search: forced, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    try {
+      const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/xrpc/_health`)
+      const body = (await res.json()) as { index: { ok: boolean }; search: { unavailable?: boolean } }
+      assert.equal(body.index.ok, false)
+      assert.equal(body.search.unavailable, true)
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
   })
 
   it('falls back to a verified Postgres for getEvent when today\'s index does not exist', async () => {

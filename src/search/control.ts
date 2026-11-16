@@ -12,6 +12,14 @@ export interface ControlRow {
 }
 
 const READ_EVERY_MS = 30_000
+/**
+ * Every read or write of search_control by the query service gives up after
+ * this long. Routing then counts Postgres as unverified, health reports
+ * search_control unavailable, and a step that needs the row (covering or
+ * checking an Elasticsearch session) fails, so the request is refused or
+ * falls back rather than hanging.
+ */
+export const CONTROL_MS = 500
 /** Every Elasticsearch first page leaves at least this long for its session (spec 3). */
 const COVER_MS = 61 * 60_000
 /** Extending once a minute is enough: a session never outlives 60 of the 61 minutes. */
@@ -56,7 +64,7 @@ export class SearchControl {
   }
 
   async refresh(): Promise<ControlRow> {
-    this.row = await readControl(this.db)
+    this.row = await within(readControl(this.db))
     this.readAt = this.now()
     return this.row
   }
@@ -80,12 +88,29 @@ export class SearchControl {
     const row = await this.current()
     if (row.elasticCursorsUntil.getTime() >= this.now() + EXTEND_BELOW_MS) return
     const until = new Date(this.now() + COVER_MS)
-    const res = await this.db.query<{ elastic_cursors_until: Date }>(
-      `update search_control set elastic_cursors_until = greatest(elastic_cursors_until, $1), updated_at = now()
-       where id = 1 returning elastic_cursors_until`,
-      [until],
+    const res = await within(
+      this.db.query<{ elastic_cursors_until: Date }>(
+        `update search_control set elastic_cursors_until = greatest(elastic_cursors_until, $1), updated_at = now()
+         where id = 1 returning elastic_cursors_until`,
+        [until],
+      ),
     )
     row.elasticCursorsUntil = res.rows[0].elastic_cursors_until
+  }
+}
+
+/** The promise's result, or a rejection once CONTROL_MS has passed. */
+async function within<T>(work: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`search_control did not answer within ${CONTROL_MS} ms`)), CONTROL_MS)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
   }
 }
 

@@ -83,26 +83,13 @@ async function routed<T>(search: Search, run: (backend: SearchBackend, opts: Cal
   }
 }
 
-/** A control read that stalls is cut off after this long and counts as unverified. */
-export const CONTROL_READ_MS = 500
-
 /**
- * search_control read fresh, bounded to 500 ms: a read that fails or stalls
- * counts as Postgres unverified, so Elasticsearch still serves as before.
+ * search_control read fresh (SearchControl bounds every read to 500 ms): a
+ * read that fails or stalls counts as Postgres unverified, so Elasticsearch
+ * still serves as before.
  */
 export async function verification(search: Pick<Search, 'control'>): Promise<Pick<ControlRow, 'pgVerified'>> {
-  let timer: NodeJS.Timeout | undefined
-  const unverified = { pgVerified: false }
-  try {
-    return await Promise.race([
-      search.control.refresh().catch(() => unverified),
-      new Promise<typeof unverified>((resolve) => {
-        timer = setTimeout(() => resolve(unverified), CONTROL_READ_MS)
-      }),
-    ])
-  } finally {
-    clearTimeout(timer)
-  }
+  return search.control.refresh().catch(() => ({ pgVerified: false }))
 }
 
 /** app.iriai.proto.getEvent: one complete event by its sidecar AT-URI. */
