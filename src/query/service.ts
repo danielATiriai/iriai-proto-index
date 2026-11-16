@@ -64,7 +64,8 @@ function view(doc: EventDoc): EventView {
  * counts as unverified, so Elasticsearch still serves as before.
  */
 async function routed<T>(search: Search, run: (backend: SearchBackend, opts: CallOptions) => Promise<T>): Promise<T> {
-  const row: Pick<ControlRow, 'pgVerified'> = await search.control.current().catch(() => ({ pgVerified: false }))
+  // Read fresh every time (one row by key): a cleared verification takes effect at once.
+  const row: Pick<ControlRow, 'pgVerified'> = await search.control.refresh().catch(() => ({ pgVerified: false }))
   const chosen = route(search.force, row)
   if (!chosen) throw new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable: Postgres is not verified yet')
   if (chosen.backend === 'postgres') {
@@ -146,7 +147,7 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
         return { backend: b, ...(await b.page(snap, q, undefined, q.limit + 1, opts)) }
       } catch (err) {
         // Not awaited: closing must not hold up the fallback (spec 5.2).
-        void b.closeSnapshot(snap).catch(() => {})
+        release(b, snap)
         throw err
       }
     }))
@@ -161,13 +162,13 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
       examined.map((h) => h.doc.uri),
     )
   } catch (err) {
-    if (!q.cursor) await backend.closeSnapshot(snapshot).catch(() => {})
+    if (!q.cursor) release(backend, snapshot)
     throw toUnavailable(err)
   }
   const events = examined.filter((h) => !suppressed.has(h.doc.uri)).map((h) => view(h.doc))
 
   if (!more) {
-    await backend.closeSnapshot(snapshot).catch(() => {})
+    release(backend, snapshot)
     return { events }
   }
   const last = examined[examined.length - 1]
@@ -177,6 +178,14 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
   )
   if (!q.cursor) deps.sessions?.opened()
   return { events, cursor }
+}
+
+/**
+ * Closes a snapshot without waiting: closing never holds up an answer, and a
+ * snapshot that fails to close expires on its own (Elasticsearch's keep-alive).
+ */
+function release(backend: SearchBackend, snapshot: string): void {
+  void backend.closeSnapshot(snapshot).catch(() => {})
 }
 
 function isMissingSnapshot(err: unknown): boolean {

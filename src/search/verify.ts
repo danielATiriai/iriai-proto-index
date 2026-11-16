@@ -46,22 +46,31 @@ export class SearchUpkeep {
     this.log(`search: comparison with today's index ${result.ok ? 'passed; Postgres is verified' : `did not pass: ${result.note}`}`)
   }
 
-  /** Projects every sidecar in index_state into Postgres, then records that the first fill is done. */
+  /**
+   * Projects every sidecar in index_state into Postgres, then records that
+   * the first fill is done, unless code that does not write event_docs
+   * changed index_state meanwhile (the generation moved): then it runs again.
+   */
   async firstFill(): Promise<number> {
+    const { generation } = await readControl(this.db)
     const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
     for (const uri of uris) await this.projector.fillPostgres(uri)
-    await this.db.query('update search_control set first_fill_done = true, updated_at = now() where id = 1')
+    const res = await this.db.query('update search_control set first_fill_done = true, updated_at = now() where id = 1 and generation = $1', [generation])
+    if (res.rowCount === 0) throw new Error('index_state changed during the fill')
     return uris.length
   }
 
   /**
    * Compares Postgres's current documents with today's index by document id
    * and content (not versions, and not indexedAt, which records when each
-   * copy was written). A pass sets pg_verified, which nothing clears.
+   * copy was written). A pass sets pg_verified only if the fill is done and
+   * the generation has not moved since the comparison began; only a change
+   * from code that does not write event_docs clears it.
    */
   async compare(): Promise<{ ok: boolean; note: string }> {
     let ok = false
     let note: string
+    const { generation } = await readControl(this.db)
     try {
       const [pg, es] = [await this.projector.postgres.currentDocs(), await this.projector.elastic.allDocs()]
       const missing = [...es.keys()].filter((uri) => !pg.has(uri))
@@ -82,10 +91,12 @@ export class SearchUpkeep {
       this.log(`search: comparison could not run: ${(err as Error).message}`)
       note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying in an hour'
     }
-    await this.db.query(
-      `update search_control set pg_verified = pg_verified or $1, compared_at = now(), note = $2, updated_at = now() where id = 1`,
-      [ok, note],
+    const res = await this.db.query(
+      `update search_control set pg_verified = pg_verified or $1, compared_at = now(), note = $2, updated_at = now()
+       where id = 1 and generation = $3 and first_fill_done`,
+      [ok, note, generation],
     )
+    if (res.rowCount === 0) return { ok: false, note: 'index_state changed during the comparison; filling again' }
     return { ok, note }
   }
 }

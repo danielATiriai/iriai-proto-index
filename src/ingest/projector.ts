@@ -1,7 +1,7 @@
 import { AtUri } from '@atproto/syntax'
 import type { Db } from '../db.js'
 import { config, eventSidecarNsid } from '../contracts/contracts.js'
-import { assemble } from '../index/assemble.js'
+import { assemble, type EventDoc } from '../index/assemble.js'
 import { ElasticBackend, type Elastic } from '../index/elastic.js'
 import { PostgresBackend } from '../search/postgres.js'
 import { NotFound, fetchRecord, listRecords, resolvePds } from './pds.js'
@@ -46,31 +46,48 @@ export class Projector {
   /** Re-assembles everything a changed record affects. */
   async recordChanged(uri: string): Promise<void> {
     const collection = new AtUri(uri).collection
-    if (collection === eventSidecarNsid) await this.projectSidecar(uri)
+    if (collection === eventSidecarNsid) await this.projectSidecars([uri])
     else if (collection === config.communityEventCollection) {
-      for (const sidecar of await sidecarsFor(this.deps.db, uri)) await this.projectSidecar(sidecar)
+      await this.projectSidecars(await sidecarsFor(this.deps.db, uri))
     }
   }
 
   async projectAccount(did: string): Promise<void> {
-    for (const sidecar of await sidecarsOfAccount(this.deps.db, did)) await this.projectSidecar(sidecar)
+    await this.projectSidecars(await sidecarsOfAccount(this.deps.db, did))
   }
 
   async projectSidecar(uri: string, { hydrate = true } = {}): Promise<void> {
-    const { db } = this.deps
-    const { result, did } = await this.assembleStored(uri)
+    await this.projectSidecars([uri], { hydrate })
+  }
 
-    if (result.complete) {
-      await this.postgres.put(result.doc)
-      await this.elastic.put(result.doc)
-      await setIndexState(db, uri, did, true, null)
-      return
+  /**
+   * Postgres and index_state first, for every sidecar, then today's index.
+   * So an Elasticsearch failure, which fails the event for a replay, never
+   * leaves Postgres or the suppression state behind: a suppressed or deleted
+   * event is already out of Postgres and hidden from open sessions on both
+   * backends (incompleteAmong) before Elasticsearch is touched.
+   */
+  async projectSidecars(uris: string[], { hydrate = true } = {}): Promise<void> {
+    const { db } = this.deps
+    const done: { uri: string; doc?: EventDoc; hydrate?: string }[] = []
+    for (const uri of uris) {
+      const { result, did } = await this.assembleStored(uri)
+      if (result.complete) {
+        await this.postgres.put(result.doc)
+        await setIndexState(db, uri, did, true, null)
+        done.push({ uri, doc: result.doc })
+      } else {
+        await this.postgres.remove(uri)
+        await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
+        done.push({ uri, hydrate: result.hydrate })
+      }
     }
-    await this.postgres.remove(uri)
-    await this.elastic.remove(uri)
-    await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
-    if (result.hydrate && hydrate && (await this.hydrate(result.hydrate))) {
-      await this.projectSidecar(uri, { hydrate: false })
+    for (const d of done) {
+      if (d.doc) await this.elastic.put(d.doc)
+      else await this.elastic.remove(d.uri)
+    }
+    for (const d of done) {
+      if (d.hydrate && hydrate && (await this.hydrate(d.hydrate))) await this.projectSidecars([d.uri], { hydrate: false })
     }
   }
 

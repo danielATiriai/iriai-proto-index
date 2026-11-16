@@ -151,13 +151,14 @@ insert into search_control (id, elastic_cursors_until) values (1, now() + interv
 -- before search on Postgres, say after a revert) leaves event_docs stale. Any
 -- such change clears the first fill and verification, so the next start fills
 -- event_docs again and compares before Postgres may serve.
+alter table search_control add column if not exists generation bigint not null default 0;
 create or replace function search_foreign_write() returns trigger language plpgsql as $fn$
 begin
   if coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
     update search_control
-      set first_fill_done = false, pg_verified = false, compared_at = null, updated_at = now(),
-          note = 'index_state was changed by code that does not write event_docs; filling again'
-      where id = 1 and (first_fill_done or pg_verified);
+      set first_fill_done = false, pg_verified = false, compared_at = null, generation = generation + 1,
+          updated_at = now(), note = 'index_state was changed by code that does not write event_docs; filling again'
+      where id = 1;
   end if;
   return null;
 end

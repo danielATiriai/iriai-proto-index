@@ -7,7 +7,7 @@ import type { EventDoc } from '../src/index/assemble.js'
 import { ElasticBackend, connectElastic, ensureIndex, type Elastic } from '../src/index/elastic.js'
 import { Handler, type JetstreamEvent } from '../src/ingest/handler.js'
 import { Projector } from '../src/ingest/projector.js'
-import { setIndexState } from '../src/ingest/store.js'
+import { incompleteAmong, setIndexState } from '../src/ingest/store.js'
 import { CursorError, decodeCursor, encodeCursor } from '../src/query/cursor.js'
 import { bindingOf, parseEventQuery } from '../src/query/params.js'
 import { createQueryServer } from '../src/query/server.js'
@@ -199,7 +199,7 @@ describe('Postgres search backend', { skip: !databaseUrl && 'TEST_DATABASE_URL n
       const slow = new PostgresBackend(db, { query: () => pool.query('select pg_sleep(3)') } as never)
       const deps = {
         db,
-        search: { elastic: undefined as never, postgres: slow, control: { current: async () => ({ pgVerified: true }) } as never, force: 'postgres' },
+        search: { elastic: undefined as never, postgres: slow, control: { current: async () => ({ pgVerified: true }), refresh: async () => ({ pgVerified: true }) } as never, force: 'postgres' },
         serviceId: 'test',
         cursorKey: randomBytes(32),
       } as QueryDeps
@@ -393,6 +393,25 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     assert.ok((await readControl(db)).elasticCursorsUntil.getTime() >= Date.now() + 60 * 60_000)
   })
 
+  it('stops serving from Postgres as soon as its verification is cleared, with no cached answer', async () => {
+    await setVerified(true)
+    const forced = { ...deps, search: { ...search, force: 'postgres' as const } }
+    await ask(PARAMS, undefined, forced)
+    await db.query('update search_control set pg_verified = false')
+    await assert.rejects(ask(PARAMS, undefined, forced), unavailable)
+    await assert.rejects(getEvent(forced, uriOf(2)), unavailable)
+    await setVerified(true)
+  })
+
+  it('answers a last page without waiting for Elasticsearch to close its snapshot', async () => {
+    const stuck = Object.assign(Object.create(search.elastic), { closeSnapshot: () => new Promise<void>(() => {}) }) as ElasticBackend
+    const started = Date.now()
+    const page = await ask('latitude=37.78&longitude=-122.43&limit=100', undefined, { ...deps, search: { ...search, elastic: stuck, force: 'elastic' } })
+    assert.equal(page.events.length, 5)
+    assert.equal(page.cursor, undefined)
+    assert.ok(Date.now() - started < 1000)
+  })
+
   it('falls back without waiting for Elasticsearch to close a snapshot', async () => {
     await setVerified(true)
     const stuck = {
@@ -540,6 +559,31 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     assert.equal((await readControl(db)).pgVerified, true)
   })
 
+  it('does not verify when index_state changes from old code while the comparison runs', async () => {
+    await db.query('update search_control set pg_verified = false, compared_at = null')
+    const upkeep = new SearchUpkeep(db, projector, () => {})
+    const real = projector.elastic.allDocs.bind(projector.elastic)
+    projector.elastic.allDocs = async () => {
+      const docs = await real()
+      const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+      await old.connect()
+      await old.query(`update index_state set updated_at = now() where uri = $1`, [`at://${AUTHOR}/${SIDECAR}/3ks2`])
+      await old.end()
+      return docs
+    }
+    try {
+      const res = await upkeep.compare()
+      assert.equal(res.ok, false)
+      const row = await readControl(db)
+      assert.equal(row.pgVerified, false)
+      assert.equal(row.firstFillDone, false)
+    } finally {
+      projector.elastic.allDocs = real
+    }
+    await upkeep.run()
+    assert.equal((await readControl(db)).pgVerified, true)
+  })
+
   it('ignores indexedAt and key order when comparing', () => {
     const a = doc(1)
     const { indexedAt: _i, view, ...rest } = a
@@ -591,5 +635,23 @@ describe('projector writes', { skip: !databaseUrl && 'TEST_DATABASE_URL not set'
     await handler.handle(commit(EVENT, '3kew1'))
     assert.equal(await projector.postgres.get(sidecar), undefined)
     assert.equal(es.docs.has(sidecar), false)
+  })
+
+  it('takes every event of a suppressed account out of Postgres and marks it, even while Elasticsearch fails', async () => {
+    const uris = []
+    for (const n of [2, 3]) {
+      await handler.handle(commit(EVENT, `3kew${n}`, eventValue({ name: `e${n}` })))
+      await handler.handle(commit(SIDECAR, `3ksw${n}`, sidecarValue(AUTHOR, `3kew${n}`, geo('37.78', '-122.43'))))
+      uris.push(`at://${AUTHOR}/${SIDECAR}/3ksw${n}`)
+    }
+    await db.query('update accounts set active = false where did = $1', [AUTHOR])
+    await db.query('insert into accounts (did, active) values ($1, false) on conflict (did) do update set active = false', [AUTHOR])
+    es.down = true
+    await assert.rejects(projector.projectAccount(AUTHOR))
+    es.down = false
+    for (const uri of uris) assert.equal(await projector.postgres.get(uri), undefined, uri)
+    const states = await db.query<{ complete: boolean }>('select complete from index_state where uri = any($1)', [uris])
+    assert.deepEqual(states.rows.map((r) => r.complete), [false, false])
+    assert.equal((await incompleteAmong(db, uris)).size, 2)
   })
 })

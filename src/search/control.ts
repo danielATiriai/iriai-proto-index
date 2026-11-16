@@ -2,6 +2,8 @@ import type { Db } from '../db.js'
 import type { BackendName } from './backend.js'
 
 export interface ControlRow {
+  /** Moved on by every change to index_state from code that does not write event_docs. */
+  generation: string
   elasticCursorsUntil: Date
   firstFillDone: boolean
   pgVerified: boolean
@@ -17,14 +19,16 @@ const EXTEND_BELOW_MS = 60 * 60_000
 
 export async function readControl(db: Db): Promise<ControlRow> {
   const res = await db.query<{
+    generation: string
     elastic_cursors_until: Date
     first_fill_done: boolean
     pg_verified: boolean
     compared_at: Date | null
     note: string | null
-  }>('select elastic_cursors_until, first_fill_done, pg_verified, compared_at, note from search_control where id = 1')
+  }>('select generation::text, elastic_cursors_until, first_fill_done, pg_verified, compared_at, note from search_control where id = 1')
   const r = res.rows[0]
   return {
+    generation: r.generation,
     elasticCursorsUntil: r.elastic_cursors_until,
     firstFillDone: r.first_fill_done,
     pgVerified: r.pg_verified,
