@@ -1,6 +1,6 @@
 # Event search on Postgres until scale: technical specification
 
-Draft v9, 2026-11-16 (v1 to v7 reviewed; v7 and v8 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
+Draft v10, 2026-11-16 (v1 to v7 reviewed; v7 to v9 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
 
 ## 1. Goal and scope
 
@@ -37,9 +37,9 @@ export interface SearchBackend {
 }
 ```
 
-The cursor gains one sealed field, `be` (`'postgres'` or `'elastic'`); cursors without it are read as `'elastic'`. A Postgres cursor is always accepted. An Elasticsearch cursor is sent to Elasticsearch only while `es_current` is set (5.2) or before `elastic_cursors_until`; otherwise, or when Elasticsearch cannot be reached and `es_current` is clear, it answers `CursorExpired`. `elastic_cursors_until` is set to now + 61 minutes whenever new sessions stop going to Elasticsearch, by the controller or by the query service when it starts with reads forced away from Elasticsearch. `CursorExpired` is an error clients already handle by searching again.
+The cursor gains one sealed field, `be` (`'postgres'` or `'elastic'`); cursors without it are read as `'elastic'`. A Postgres cursor is always accepted. An Elasticsearch cursor is sent to Elasticsearch only before `elastic_cursors_until`; after it, it answers `CursorExpired`, so an old cursor never wakes a sleeping Elasticsearch. Every Elasticsearch first page moves `elastic_cursors_until` to at least now + 61 minutes (one row update, at most once a minute), and PR 1's migration sets it to the deploy time + 61 minutes for cursors issued before it. No session lasts over an hour, so this one field covers every open Elasticsearch session, whatever ended it. `CursorExpired` is an error clients already handle by searching again.
 
-`getEvent` follows the same rule as `queryEvents` (5.2): it reads the backend that would serve a new session.
+`getEvent` follows the same rule as `queryEvents` (5.2).
 
 ## 4. The Postgres backend
 
@@ -67,7 +67,7 @@ Indexes, each partial on current rows: unique `(uri)`, `(starts_at, uri)`, `(lat
 
 ### 4.2 Writes
 
-Every `put` and every `remove` runs in one transaction that first takes `pg_advisory_xact_lock(7140015)` and only then takes a new number from `event_doc_version`. The order matters: a number taken before the lock could be lower than a snapshot read in between. The Elasticsearch write (5.1) follows the commit, outside the lock, with a 2 s timeout; a failure raises `dirty_gen`.
+Every `put` and every `remove` runs in one transaction that first takes `pg_advisory_xact_lock(7140015)` and only then takes a new number from `event_doc_version`. The order matters: a number taken before the lock could be lower than a snapshot read in between. While a managed index is in use (5.1), the same transaction also inserts `(uri, version, now())` into `es_pending`. The Elasticsearch write follows the commit, outside the lock, with a 2 s timeout, and its success deletes that row.
 
 <!-- dp D1 -->
 `put` closes the current row (`closed_version` = the new number, `closed_at = clock_timestamp()` read after the lock) and inserts the new row with `version` = the new number. `remove` closes the current row the same way and inserts nothing. Closed rows are deleted once `closed_at` is more than 61 minutes old (every 10 minutes, by the ingester): no paging session lasts longer than an hour.
@@ -93,7 +93,7 @@ Keyset paging: `(sortkey, uri) > ($after_key, $after_uri)`, with nulls last hand
 - `author`: `did = any($1)`; `eventUri`: `event_uri = $1`.
 - Sort by distance: `arc_m(...) nulls last, uri`; by start: `starts_at nulls last, uri`; default `uri`.
 
-Distances will not match Elasticsearch to the millimetre: Elasticsearch stores each point rounded to about 1 cm and uses an approximate haversine. Results are the same set; two results whose distances differ by less than about 5 cm can appear in either order, and an event within about 5 cm of a radius edge can fall on either side.
+Distances will not match Elasticsearch exactly: Elasticsearch stores each point rounded to about 1 cm and uses Lucene's approximate haversine, documented to err by up to 40 cm (far less at local distances). Results are the same set; two results whose distances differ by under 1 m can appear in either order, and an event within 1 m of a radius edge can fall on either side.
 
 Every search runs with `statement_timeout` 2 s on its own pool of 5 connections, so a slow search cannot take ingestion's connections; it still shares Postgres's CPU and disk. A search that hits the limit answers `ServiceUnavailable`: near the trigger, the default search (a coordinate and no radius, which sorts every event) can fail this way rather than only slow down. Timeouts count toward the trigger (6.1).
 
@@ -117,20 +117,22 @@ Table and indexes: 14 MB at 10,000 events, 133 MB at 100,000, 1.33 GB at 1,000,0
 
 ### 5.1 Projector
 
-Every `put` and `remove` goes to Postgres first, which gives it its version. It goes to Elasticsearch as well only while Elasticsearch is in use (5.2), with `version_type: external` and that version, so an older write never replaces a newer one; a version conflict (409) means Elasticsearch already holds a newer version and counts as success. Every index Elasticsearch serves from is built from Postgres with these versions (5.4); Elasticsearch's own version numbers are never compared.
+Every `put` and `remove` goes to Postgres first, which gives it its version. Elasticsearch is then written in one of two ways:
 
-While Postgres is not verified (5.2), a failed Elasticsearch write fails the event as today, so it is replayed; Elasticsearch lags by the replay time, as today, and stays current. Once Postgres is verified, a failed Elasticsearch write never fails the event: the projector raises `search_control.dirty_gen` by one and moves on, Elasticsearch stops being current, and the repair (6.4) restores it. From then on an Elasticsearch outage no longer stalls ingestion.
+- PR 1, today's index: the write goes to it exactly as today, with Elasticsearch's own versions; a failure fails the event, which is replayed. Today's index stays as current as it is today, and an Elasticsearch outage stalls ingestion, as today.
+- PR 2, a managed index: only while Elasticsearch is in use (5.2), with `version_type: external` and the Postgres version, so an older write never replaces a newer one; a version conflict (409) counts as success. A failure never fails the event: its `es_pending` row (4.2) stays and is replayed. A managed index is always built from Postgres (5.4), so Elasticsearch's own version numbers are never compared with Postgres's. PR 2 stops writing today's index.
 
 ### 5.2 Elasticsearch is optional
 
-The Elasticsearch client connects lazily; neither role waits for it at start-up. One rule governs every read, whoever chose the backend: **a backend serves only while it may serve, and Postgres, once verified, always may.**
+The Elasticsearch client connects lazily; neither role waits for it at start-up. One rule governs every read, `queryEvents` and `getEvent`, whoever chose the backend: **a backend serves only while it may serve, and Postgres, once verified, always may.**
 
-- Postgres may serve once it is verified: its first fill (5.4) is recorded and the ingester's own comparison (the verifying check of 6.4) has passed once. Verified is a latch: nothing clears it. Every write reaches Postgres first (5.1), so it cannot fall behind. The ingester runs the comparison after the first fill and hourly until it passes, and opens an issue on each failure; no sentence or command is needed.
-- Elasticsearch may serve while `es_current` is set and no write to it has failed since the last repair (`dirty_gen` = `repaired_gen`). It is in use while `SEARCH_ES=on` on the ingester (default `on`) or, after PR 2, the controller is in `starting` to `draining`. While in use, the ingester writes to it (5.1), sends a cluster-health request every 2 minutes (recording `es_seen_at`), and every 10 minutes repairs it if dirty (reconcile, 6.4). When use begins and `es_current` is clear, the ingester builds a fresh index and then sets `es_current`; when use ends, it clears `es_current` and sends nothing more. Use cannot end before Postgres is verified: until then the ingester ignores `SEARCH_ES=off`, opens an issue and says so in health.
-- The may-serve check for Elasticsearch reads the control row fresh at each first page (one single-row read), not the 30-second copy. A write that Elasticsearch has not yet taken or has just failed can still be missed by a session opened within the next 2 seconds, the write's timeout; Elasticsearch's own 1-second refresh already gives the same kind of delay today.
-- A new session goes to the chosen backend (the state, or `SEARCH_BACKEND_FORCE`) if it may serve, else to Postgres if verified, else answers `ServiceUnavailable`. A first page Elasticsearch fails within 2 seconds is answered from Postgres if verified. Health reports which backend served and why.
+- Postgres may serve once verified: its first fill (5.4) is recorded and the ingester's comparison has passed once. Verified is a latch. Every write reaches Postgres first, so it cannot fall behind. The comparison runs after the first fill and hourly until it passes; in PR 1 it compares document ids and contents with today's index (not versions) and reports in health, which the thread checks (7, step 2). From PR 2 each failure also opens an issue.
+- Today's index may serve while it is written as in PR 1; nothing serves from it after PR 2 deploys.
+- A managed index may serve while `es_current` is set and no `es_pending` row is older than 2 seconds, read fresh at each first page (one indexed query). Any write Elasticsearch has not confirmed, whatever the reason (a failure, a timeout, the ingester stopping between the two writes), takes it out of new sessions 2 seconds later and keeps it out until replayed. A session opened within those 2 seconds can miss that write, as Elasticsearch's own 1-second refresh already allows today.
+- Elasticsearch is in use while `SEARCH_ES=on` on the ingester (default `on`) or the controller is in `starting` to `draining`. While in use, the ingester writes to it (5.1) and every 2 minutes sends a cluster-health request (recording `es_seen_at`) and replays `es_pending` rows older than 2 s, and once at start-up. When use begins and `es_current` is clear, the ingester builds a managed index (5.4) and then sets `es_current`. Use ends only once `elastic_cursors_until` has passed; the ingester then clears `es_current` and `es_pending` and sends nothing more. Use cannot end before Postgres is verified: until then the ingester ignores `SEARCH_ES=off`, opens an issue and says so in health.
+- A new session goes to the chosen backend (the state, or `SEARCH_BACKEND_FORCE`) if it may serve, else to Postgres if verified, else answers `ServiceUnavailable`; a first page Elasticsearch fails within 2 seconds is answered the same way. Health reports which backend served and why.
 
-So after verification, Postgres always serves when Elasticsearch cannot; before it, Elasticsearch is the only backend, as today. Later comparisons (verifying, 6.4) only decide whether the controller switches to Elasticsearch; they never change what may serve. Cost of the rule: a switch to Elasticsearch waits for a full fill; a dirty Elasticsearch hands new sessions to Postgres until a repair succeeds (every 10 minutes while it answers, so through any outage); a new Elasticsearch session can miss a write made in the last 2 seconds; until the first comparison passes, Elasticsearch stays on at today's cost, its failures answer `ServiceUnavailable` and its outages stall ingestion, as today.
+Cost of the rule: until Postgres is verified, Elasticsearch serves alone and behaves exactly as today, failures and outages included; a switch to Elasticsearch waits for a full build; any unconfirmed write hands new sessions to Postgres until replayed (every 2 minutes while Elasticsearch answers, so for as long as an outage lasts); a new Elasticsearch session can miss a write from the last 2 seconds; while in use, every write also inserts and deletes one `es_pending` row.
 
 ### 5.3 Health
 
@@ -138,11 +140,11 @@ So after verification, Postgres always serves when Elasticsearch cannot; before 
 
 ### 5.4 First fill and rebuild
 
-On first start after deploy, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done. Today's index is not trusted, because its version numbers are Elasticsearch's own: the ingester then builds a fresh index from Postgres with external versions (backfill and reconcile, 6.4), sets `es_current` and treats the old index as the previous one (below). Until both are done, `queryEvents` and `getEvent` answer `ServiceUnavailable` with Retry-After, a few seconds at today's size. Whenever a fresh index becomes current, the previous one is kept until `elastic_cursors_until` (61 minutes) so open paging sessions finish, then deleted. At every tick the ingester deletes any index that is neither current nor that previous one, which removes candidates left by a failed build.
+On first start after PR 1 deploys, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done; meanwhile today's index serves, as today. A managed index is built whenever Elasticsearch use begins with `es_current` clear, including at the PR 2 deploy while `SEARCH_ES` is still `on`: a fresh index `placeproto-events-<n>` (n a counter in `search_control`, raised per build) with today's mapping and `index.gc_deletes` 2 hours; every current row copied, 500 per bulk request, with external versions; then reconciled (6.4). At every tick, an index that is not current is deleted once `elastic_cursors_until` has passed (3). That removes today's index after PR 2 and any candidate left by a failed build, and never an index an open session can still reach.
 
 ## 6. The scale controller
 
-Runs in the ingester every 10 minutes, under a session advisory lock (7140016) taken and released on one dedicated client, so only one runs. State is one row in `search_control` (state, since, elastic_index, elastic_cursors_until, last_switch_on, failures, disabled, dirty_gen, repaired_gen, first_fill_done, note). The query service reads it every 30 seconds for routing; the may-serve check of 5.2 is read fresh at each first page.
+Runs in the ingester every 10 minutes, under a session advisory lock (7140016) taken and released on one dedicated client, so only one runs. State is one row in `search_control` (state, since, elastic_index, elastic_cursors_until, last_switch_on, failures, disabled, es_current, es_seen_at, first_fill_done, pg_verified, note); unconfirmed Elasticsearch writes are rows of `es_pending` (4.2). The query service reads it every 30 seconds for routing; the may-serve check of 5.2 is read fresh at each first page.
 
 ### 6.1 What is measured
 
@@ -179,10 +181,10 @@ off → ready → starting → backfilling → verifying → on → draining →
 - ready → starting: the controller opens a GitHub issue in danielATiriai/iriai-proto-index (GitHub emails Daniel) and turns Elasticsearch on (6.3).
 - starting: waits for cluster health yellow or green, up to 30 minutes.
 - backfilling: creates a fresh index `placeproto-events-<n>`, where n is a counter in `search_control` raised for every build, with today's mapping and `index.gc_deletes` 2 hours; copies every current row, 500 per bulk request, with external versions; then reconciles.
-- Reconcile: notes `dirty_gen` at its start, reads every document id and version from Elasticsearch and compares with the current rows: re-puts missing or older documents; for a document with no current row, takes a fresh number and re-checks Postgres under the write lock, then, after commit and only if there was still no current row, deletes in Elasticsearch with that number. At its end it sets `repaired_gen` to the generation it noted, so a write that failed during the pass leaves `dirty_gen` above `repaired_gen` and is repaired next tick. Runs at the end of every fill, every 10 minutes while dirty, and once a day while in use (5.2).
-- verifying: after a refresh, the id-and-version sets must be equal; then for each stored query shape (or 50 built-in shapes when fewer are stored) each event in positions 1 to 45 of one backend's 51-result first page must appear in the other's 51, and those shared events must be in the same order apart from results whose distances differ by under 5 cm; events within 5 cm of a radius edge are ignored. A difference involving an event that changed during the check is retried, up to 3 times. Any other difference is a failure.
+- Reconcile: reads every document id and version from Elasticsearch and compares with the current rows. Each document missing or older, and each with no current row, gets an `es_pending` row (for one with no current row, with a fresh number taken under the write lock after re-checking that there is still none), so a difference takes Elasticsearch out of new sessions until replayed. Replaying a pending row puts the current row with its version or, with no current row, deletes with the pending row's number; it then deletes the pending rows it covered. Runs at the end of every build and once a day while in use (5.2).
+- verifying: after a refresh, with no pending rows, the id-and-version sets must be equal; then, for each stored query shape (or 50 built-in shapes when fewer are stored), the first 50 results of both backends must be the same events in the same order, where results whose distances differ by under 1 m count as tied and may be in either order, a tie group that crosses position 50 is fetched whole from both and compared as a set, and events within 1 m of a radius edge are ignored. A difference involving an event that changed during the check is retried, up to 3 times. Any other difference is a failure.
 - on: new sessions use Elasticsearch, within the rule of 5.2. A later page of an Elasticsearch session that fails answers `ServiceUnavailable`, as today. If more than 20 first pages fall back within 10 minutes while `es_seen_at` is under 5 minutes old, or the cluster is red or no keep-awake has been answered for 30 minutes since the ingester started (compared in SQL), the controller moves to draining and opens an issue.
-- draining: new sessions use Postgres; `elastic_cursors_until` = now + 61 minutes; after that, use ends (5.2) and Elasticsearch is turned off (6.3).
+- draining: new sessions use Postgres; once `elastic_cursors_until` has passed, use ends (5.2) and Elasticsearch is turned off (6.3).
 - Failure: any failure in starting, backfilling or verifying turns Elasticsearch off again (6.3), returns to `off`, counts a failure and opens an issue.
 
 <!-- dp D3 -->
@@ -198,13 +200,13 @@ After 2 failures in 30 days the controller sets `disabled` and does nothing unti
 
 ## 7. Switching today's service over
 
-1. PR 1: interface, Postgres backend, `event_docs`, Elasticsearch optional at start-up, the rule of 5.2 with `SEARCH_ES=on`, cursor `be` and `elastic_cursors_until`, `getEvent` under the same rule, health, `SEARCH_BACKEND_FORCE` (default `elastic`). Deploy; the first fill and the fresh index (5.4) run.
-2. The ingester's comparison (5.2) passes and health shows `pgVerified: true`; the thread checks this before steps 3 and 4. With 9 events in one neighborhood this exercises little; the double-run CI tests (10) are the real guard.
+1. PR 1: interface, Postgres backend, `event_docs`, Elasticsearch optional at start-up, writes to Postgres and then to today's index as today (5.1), the rule of 5.2, cursor `be` and `elastic_cursors_until`, health, `SEARCH_BACKEND_FORCE` (default `elastic`). Deploy; the first fill runs.
+2. The comparison passes and health shows `pgVerified: true`; the thread checks this before step 3 and tells Daniel if it does not pass, while today's index keeps serving and billing as today. With 9 events in one neighborhood this exercises little; the double-run CI tests (10) are the real guard.
 3. Daniel's sentence: set `SEARCH_BACKEND_FORCE=postgres` on the query service.
-4. After 61 minutes, Daniel's sentences: set `SEARCH_ES=off` on the ingester; then, under D3 A, turn on Serverless for Elasticsearch (and watch it sleep within 10 minutes on Railway's metrics), or under D3 B or C, remove the Elasticsearch deployment. Set Elasticsearch's limits to 2 GB of memory and 1 vCPU.
-5. PR 2: stats, controller, GitHub issues. Daniel's sentence: clear `SEARCH_BACKEND_FORCE` and set the controller's variables on the ingester.
+4. PR 2: managed index, `es_pending` and replay, stats, GitHub issues and, unless D2 is held, the controller. Daniel stores the GitHub token before it. On deploy, with `SEARCH_ES=on`, the ingester builds a managed index; today's index is deleted an hour after its last session.
+5. Daniel's sentences: set `SEARCH_ES=off` on the ingester; under D3 A turn on Serverless for Elasticsearch (and watch it sleep within 10 minutes on Railway's metrics), under D3 B, C or Hold remove the Elasticsearch deployment; set Elasticsearch's limits to 2 GB of memory and 1 vCPU; clear `SEARCH_BACKEND_FORCE` and set the controller's variables, if it is built.
 
-Undo, before or after PR 2: under D3 B or C redeploy Elasticsearch; set `SEARCH_ES=on` on the ingester and `SEARCH_BACKEND_FORCE=elastic` on the query service together. Reads move once the ingester has rebuilt the index (5.2), minutes at today's size; until then Postgres serves.
+Undo. Until step 5: set `SEARCH_BACKEND_FORCE=elastic`, since Elasticsearch is still written; before PR 2, reverting PR 1 also works. After step 5: under D3 B, C or Hold redeploy Elasticsearch first; then set `SEARCH_ES=on` on the ingester and `SEARCH_BACKEND_FORCE=elastic` on the query service together. Reads move once a managed index is built and current (5.2), minutes at today's size; until then Postgres serves.
 
 ## 8. Costs (Railway Pro)
 
@@ -212,9 +214,10 @@ Prices: $10 per GB of memory a month and $20 per vCPU a month [docs]; volumes ab
 
 - Today: Elasticsearch about $13 a month (1.28 GB held around the clock, near-zero CPU, 0.25 GB volume).
 - Below the trigger, today and at ten times today's events: Elasticsearch $0.04 a month (volume only); Postgres adds $0.10 to $0.50 a month.
+- Postgres CPU for searches: the spike's slowest shapes took about 0.3 s of one CPU at a million events; taking that as the cost of every search at 500,000, 10,000 searches a day use about 0.035 vCPU, about $0.70 a month, in proportion to traffic. Today's traffic is not measured [unverified]; 6.1 records it.
 - At the trigger (about 500,000 events): Postgres about 0.7 GB of table and up to 1 GB of memory, $5 to $10 a month; Elasticsearch, while on, $13 to $20 a month.
 - Stop point: Elasticsearch's service limits of 2 GB memory and 1 vCPU (Daniel's sentence) cap its compute at about $40 a month; realistic $13 to $20. Its disk is billed on top and has no stop point: one current index, plus the previous one for 61 minutes after a switch (5.4), about 0.7 GB per 500,000 events, so about $0.10 a month at 500,000 and $0.20 at a million [price unverified]. At the memory limit Railway restarts it; first pages fall back to Postgres, later pages of its sessions get `ServiceUnavailable`, and repeated fallbacks drain it (6.4).
-- Postgres, and Elasticsearch's disk, have no stop point. Exposure estimate: about $11 a month at 500,000 events (Postgres 1 GB memory at $10, disk under $1), which nothing enforces: the workspace alert at $55 only warns. For Daniel to accept by name: "Index search: no stop point on Postgres or Elasticsearch's disk, exposure estimate $11 a month accepted".
+- Postgres, and Elasticsearch's disk, have no stop point. Exposure estimate: about $12 a month at 500,000 events and 10,000 searches a day (Postgres 1 GB memory at $10, CPU about $0.70, disk under $1; each further 10,000 searches a day adds about $0.70), which nothing enforces: the workspace alert at $55 only warns. For Daniel to accept by name: "Index search: no stop point on Postgres or Elasticsearch's disk, exposure estimate $12 a month accepted".
 - GitHub: the issues API on the free plan bills nothing.
 
 ## 9. Secrets and settings
@@ -232,4 +235,4 @@ Prices: $10 per GB of memory a month and $20 per vCPU a month [docs]; volumes ab
 
 ## 10. Tests
 
-CI runs every filter, sort, paging and suppression test against both backends with the same fixtures, including antimeridian boxes, unresolved points, ties and radius edges. New tests: snapshot exactness with concurrent writes (D1 A); versions on put, remove and upsert; backfill racing writes and deletes; the reconcile; start-up with Elasticsearch unreachable (both roles serve, ingestion continues); cursor `be` and `elastic_cursors_until`; the controller's states with a fake clock and a fake Railway; threshold edges; first-page fallback.
+CI runs every filter, sort, paging and suppression test against both backends with the same fixtures, including antimeridian boxes, unresolved points, ties and radius edges. New tests: snapshot exactness with concurrent writes (D1 A); versions on put, remove and upsert; backfill racing writes and deletes; the reconcile; start-up with Elasticsearch unreachable (both roles serve; from PR 2 ingestion continues); the ingester stopped between the Postgres commit and the Elasticsearch write (Elasticsearch leaves new sessions within 2 s and is replayed at restart); cursor `be`, `elastic_cursors_until` and index deletion; the controller's states with a fake clock and a fake Railway; threshold edges; first-page fallback.
