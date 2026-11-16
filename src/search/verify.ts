@@ -23,6 +23,12 @@ export const SETTLE_MS = 30_000
  */
 export class SearchUpkeep {
   settleMs = SETTLE_MS
+  /**
+   * Where the fill and the comparison record their result: during run(), the
+   * connection holding the upkeep lock, so a run whose lock session has
+   * ended (and another ingester may now run upkeep) can record nothing.
+   */
+  private publisher?: Db
 
   constructor(
     private db: Db,
@@ -51,8 +57,10 @@ export class SearchUpkeep {
       holds = (await client.query<{ ok: boolean }>('select pg_try_advisory_lock($1) as ok', [UPKEEP_LOCK])).rows[0].ok
       if (!holds) return
       try {
+        this.publisher = client as unknown as Db
         await this.runLocked()
       } finally {
+        this.publisher = undefined
         holds = !(await client.query<{ ok: boolean }>('select pg_advisory_unlock($1) as ok', [UPKEEP_LOCK])).rows[0].ok
       }
     } catch (err) {
@@ -100,7 +108,7 @@ export class SearchUpkeep {
     await this.settle()
     const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
     for (const uri of uris) await this.projector.fillPostgres(uri)
-    const res = await this.db.query(
+    const res = await (this.publisher ?? this.db).query(
       `update search_control set first_fill_done = true, fill_generation = $1, pg_verified = false, compared_at = null, note = null, updated_at = now()
        where id = 1 and search_generation_now() = $1`,
       [generation],
@@ -143,7 +151,7 @@ export class SearchUpkeep {
       this.log(`search: comparison could not run: ${(err as Error).message}`)
       note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying at the next upkeep'
     }
-    const res = await this.db.query(
+    const res = await (this.publisher ?? this.db).query(
       `update search_control
          set pg_verified = case when $4 then $1 else pg_verified end,
              compared_at = case when $4 then now() else compared_at end, note = $2, updated_at = now()

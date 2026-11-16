@@ -1000,6 +1000,33 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     assert.equal((await readControl(db)).pgVerified, true)
   })
 
+  it('records nothing from an upkeep run whose lock session has ended', async () => {
+    await db.query('update search_control set pg_verified = false, first_fill_done = true, fill_generation = search_generation_now(), compared_at = null')
+    const extra = { ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks1`))!, uri: `at://${AUTHOR}/${SIDECAR}/3ksgone` }
+    await projector.postgres.put(extra)
+    const real = projector.elastic.allDocs.bind(projector.elastic)
+    projector.elastic.allDocs = async () => {
+      // The server ends the session holding the upkeep lock mid-comparison;
+      // another ingester could now take the lock and verify.
+      const holder = await db.query<{ pid: number }>(`select pid from pg_locks where locktype = 'advisory' and objid = 7140016 and granted`)
+      assert.equal(holder.rowCount, 1)
+      await db.query('select pg_terminate_backend($1)', [holder.rows[0].pid])
+      await new Promise((r) => setTimeout(r, 100))
+      // Another ingester's upkeep, holding the lock now, verifies.
+      await db.query('update search_control set pg_verified = true, compared_at = now()')
+      return real()
+    }
+    try {
+      await new SearchUpkeep(db, projector, () => {}).run()
+    } finally {
+      projector.elastic.allDocs = real
+      await projector.postgres.remove(extra.uri)
+    }
+    const row = await readControl(db)
+    assert.equal(row.pgVerified, true, 'a run that lost its lock recorded its comparison over a later one')
+    await db.query('update search_control set compared_at = null')
+  })
+
   it('leaves verification as it is when a comparison cannot run', async () => {
     await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now()')
     const real = projector.elastic.allDocs.bind(projector.elastic)

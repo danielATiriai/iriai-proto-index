@@ -226,6 +226,8 @@ export async function checkout(pool: pg.Pool): Promise<pg.PoolClient> {
 
 export async function migrate(db: Db): Promise<void> {
   const client = await checkout(db)
+  // A connection that may still hold the migration lock is destroyed, not
+  // pooled, which ends its session and so releases the lock.
   try {
     await client.query('select pg_advisory_lock(7140014)')
     await client.query(MIGRATION)
@@ -237,7 +239,7 @@ export async function migrate(db: Db): Promise<void> {
        on conflict (id) do update set elastic_cursors_until = greatest(search_control.elastic_cursors_until, excluded.elastic_cursors_until)`,
     )
   } finally {
-    await client.query('select pg_advisory_unlock(7140014)').catch(() => {})
-    client.release()
+    const unlocked = await client.query<{ ok: boolean }>('select pg_advisory_unlock(7140014) as ok').then((r) => r.rows[0].ok, () => false)
+    client.release(unlocked ? undefined : new Error('migration lock not confirmed released'))
   }
 }
