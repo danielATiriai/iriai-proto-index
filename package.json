@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/main.js",
-    "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
+    "test": "npm run build && node --test --test-concurrency=1 --test-timeout=60000 \"dist/test/**/*.test.js\"",
     "check-contracts": "bash scripts/check-contracts.sh"
   },
   "dependencies": {

@@ -163,9 +163,32 @@ begin
   return null;
 end
 $fn$;
+-- Every table the ingester writes, not only index_state: code that does not
+-- write event_docs (an older deploy) changes records or accounts first, and
+-- may fail before index_state, yet Postgres is already behind (the rule
+-- fails closed: any such write sends Postgres back through fill and compare).
 create or replace trigger index_state_foreign_write after insert or update or delete on index_state
   for each statement execute function search_foreign_write();
+create or replace trigger records_foreign_write after insert or update or delete on records
+  for each statement execute function search_foreign_write();
+create or replace trigger accounts_foreign_write after insert or update or delete on accounts
+  for each statement execute function search_foreign_write();
+create or replace trigger checkpoints_foreign_write after insert or update or delete on checkpoints
+  for each statement execute function search_foreign_write();
+create or replace trigger skipped_events_foreign_write after insert or update or delete on skipped_events
+  for each statement execute function search_foreign_write();
 `
+
+/**
+ * Whether this pool's connections carry iriai.search_writer=1 as the server
+ * sees it. A connection pooler that drops start-up options would make every
+ * write of this code look foreign: Postgres would then never be verified,
+ * which fails closed, and start-up logs it.
+ */
+export async function searchWriterSeen(db: Db): Promise<boolean> {
+  const res = await db.query<{ v: string | null }>(`select current_setting('iriai.search_writer', true) as v`)
+  return res.rows[0].v === '1'
+}
 
 export async function migrate(db: Db): Promise<void> {
   const client = await db.connect()

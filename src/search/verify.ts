@@ -56,7 +56,7 @@ export class SearchUpkeep {
     const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
     for (const uri of uris) await this.projector.fillPostgres(uri)
     const res = await this.db.query('update search_control set first_fill_done = true, updated_at = now() where id = 1 and generation = $1', [generation])
-    if (res.rowCount === 0) throw new Error('index_state changed during the fill')
+    if (res.rowCount === 0) throw new Error('an ingestion table changed during the fill')
     return uris.length
   }
 
@@ -96,7 +96,7 @@ export class SearchUpkeep {
        where id = 1 and generation = $3 and first_fill_done`,
       [ok, note, generation],
     )
-    if (res.rowCount === 0) return { ok: false, note: 'index_state changed during the comparison; filling again' }
+    if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }
     return { ok, note }
   }
 }

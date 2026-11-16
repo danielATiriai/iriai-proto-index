@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { connect, migrate } from './db.js'
+import { connect, migrate, searchWriterSeen } from './db.js'
 import { ElasticBackend, connectElastic } from './index/elastic.js'
 import { Ingester } from './ingest/ingester.js'
 import { Projector } from './ingest/projector.js'
@@ -19,6 +19,11 @@ const es = connectElastic(settings.elasticUrl)
 // Neither role waits for Elasticsearch (spec 5.2): the ingester creates
 // today's index on its first write, and the query service routes around it.
 await waitFor('PostgreSQL', () => migrate(db))
+log(
+  (await searchWriterSeen(db))
+    ? 'search: this service\'s connections are marked as writers of event_docs'
+    : 'search: WARNING: iriai.search_writer is not set on this service\'s connections (a pooler may drop it); Postgres will not be verified',
+)
 
 let ingester: Ingester | undefined
 if (settings.role !== 'query') {

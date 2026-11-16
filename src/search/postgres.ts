@@ -236,6 +236,9 @@ export function pageSql(snapshot: string, q: EventQuery, after: unknown[] | unde
   const where = (visible: string) => [visible, ...filters].join(' and ')
   const current = `closed_version is null and version <= ${w}`
   const closed = `closed_version is not null and version <= ${w} and closed_version > ${w}`
+  // Each branch orders by the column itself, so the (starts_at, uri) index
+  // serves it; the merged rows are then ordered by the returned key.
+  const branchOrder = key ? `order by ${key} asc nulls last, uri asc` : 'order by uri asc'
   const order = key ? 'order by k asc nulls last, uri asc' : 'order by uri asc'
   const limit = `limit ${p(size, '::int')}`
 
@@ -244,7 +247,7 @@ export function pageSql(snapshot: string, q: EventQuery, after: unknown[] | unde
   const text = windowed
     ? `with matched as materialized (${select} where ${where(current)} union all ${select} where ${where(closed)})
        select uri, doc, k from matched ${order} ${limit}`
-    : `select uri, doc, k from ((${select} where ${where(current)} ${order} ${limit})
-       union all (${select} where ${where(closed)} ${order} ${limit})) as matched ${order} ${limit}`
+    : `select uri, doc, k from ((${select} where ${where(current)} ${branchOrder} ${limit})
+       union all (${select} where ${where(closed)} ${branchOrder} ${limit})) as matched ${order} ${limit}`
   return { text, values }
 }

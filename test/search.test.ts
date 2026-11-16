@@ -2,7 +2,7 @@ import { after, before, beforeEach, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
-import { migrate, type Db } from '../src/db.js'
+import { migrate, searchWriterSeen, type Db } from '../src/db.js'
 import type { EventDoc } from '../src/index/assemble.js'
 import { ElasticBackend, connectElastic, ensureIndex, type Elastic } from '../src/index/elastic.js'
 import { Handler, type JetstreamEvent } from '../src/ingest/handler.js'
@@ -14,7 +14,7 @@ import { createQueryServer } from '../src/query/server.js'
 import { XrpcError, getEvent, queryEvents, type QueryDeps, type Search } from '../src/query/service.js'
 import { bindingHash } from '../src/query/cursor.js'
 import { SearchControl, readControl } from '../src/search/control.js'
-import { PostgresBackend, searchPool } from '../src/search/postgres.js'
+import { PostgresBackend, pageSql, searchPool } from '../src/search/postgres.js'
 import { SearchUpkeep, comparable } from '../src/search/verify.js'
 import { EVENT, SIDECAR, eventValue, geo, sidecarValue } from './fixtures.js'
 import pg from 'pg'
@@ -168,16 +168,30 @@ describe('Postgres search backend', { skip: !databaseUrl && 'TEST_DATABASE_URL n
     assert.deepEqual(next.hits.map((h) => h.doc.uri), [uriOf(3)], 'millisecond-exact keyset')
   })
 
+  it('pages by start time on the (starts_at, uri) index', async () => {
+    const { text, values } = pageSql('9223372036854775807', q('sort=startsAt&limit=10'), [Date.parse('2026-01-01'), uriOf(1)], 11)
+    const client = await db.connect()
+    try {
+      await client.query('set enable_seqscan = off; set enable_bitmapscan = off; set enable_sort = off')
+      const plan = (await client.query(`explain ${text}`, values)).rows.map((r) => r['QUERY PLAN']).join('\n')
+      assert.match(plan, /event_docs_current_start/)
+    } finally {
+      await client.query('reset enable_seqscan; reset enable_bitmapscan; reset enable_sort').catch(() => {})
+      client.release()
+    }
+  })
+
   it('gives up waiting for a search connection after 2 seconds when all five are busy', async () => {
     const pool = searchPool(dbUrl('pg_search_test'))
+    const held: pg.PoolClient[] = []
     try {
-      const held = await Promise.all(Array.from({ length: 5 }, () => pool.connect()))
+      for (let i = 0; i < 5; i++) held.push(await pool.connect())
       const started = Date.now()
       await assert.rejects(new PostgresBackend(db, pool).count(), /timeout/)
       const waited = Date.now() - started
       assert.ok(waited >= 1_900 && waited < 2_600, `gave up after ${waited} ms`)
-      for (const c of held) c.release()
     } finally {
+      for (const c of held) c.release()
       await pool.end()
     }
   })
@@ -365,6 +379,43 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     assert.equal(res.value.uri, uriOf(2))
   })
 
+  it('cuts off a stalled search_control read after 500 ms and serves getEvent from Elasticsearch', async () => {
+    const stalled = { refresh: () => new Promise(() => {}) } as unknown as SearchControl
+    const started = Date.now()
+    const res = await getEvent({ ...deps, search: { ...search, control: stalled } }, uriOf(2))
+    assert.equal(res.value.uri, uriOf(2))
+    assert.ok(Date.now() - started < 1_500, `took ${Date.now() - started} ms`)
+  })
+
+  it('falls back to a verified Postgres for getEvent when today\'s index does not exist', async () => {
+    await setVerified(true)
+    const missing = new ElasticBackend(es, `${INDEX}-missing`)
+    const res = await getEvent({ ...deps, search: { ...search, elastic: missing } }, uriOf(2))
+    assert.equal(res.value.uri, uriOf(2))
+  })
+
+  it('reports a slow Elasticsearch in health as before while Postgres is not verified', async () => {
+    await setVerified(false)
+    const slow = {
+      name: 'elastic',
+      count: async (opts: { signal?: AbortSignal } = {}) => {
+        assert.equal(opts.signal, undefined, 'no 2-second limit before verification')
+        await new Promise((r) => setTimeout(r, 2_300))
+        return 5
+      },
+    } as unknown as ElasticBackend
+    const server = createQueryServer({ db, search: { ...search, elastic: slow }, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    try {
+      const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/xrpc/_health`)
+      const body = (await res.json()) as { index: { ok: boolean; backend: string; events: number } }
+      assert.deepEqual(body.index, { ok: true, backend: 'elastic', events: 5 })
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+      await setVerified(true)
+    }
+  })
+
   it('waits for a slow Elasticsearch as before while Postgres is not verified', async () => {
     await setVerified(false)
     const slow = {
@@ -385,6 +436,16 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     const missing = new ElasticBackend(es, `${INDEX}-missing`)
     await assert.rejects(ask(PARAMS, undefined, { ...deps, search: { ...search, elastic: missing } }), unavailable)
     await setVerified(true)
+  })
+
+  it('marks this service\'s connections as writers of event_docs, and no others', async () => {
+    assert.equal(await searchWriterSeen(db), true)
+    const other = new pg.Pool({ connectionString: dbUrl('routing_test') })
+    try {
+      assert.equal(await searchWriterSeen(other), false)
+    } finally {
+      await other.end()
+    }
   })
 
   it('covers cursors from a previous deployment when it starts', async () => {
@@ -545,15 +606,41 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     assert.equal(row.pgVerified, false)
     assert.equal(row.firstFillDone, false)
 
-    // This service's own writes do not trip it.
+    // This service's own writes do not trip it: the generation stays put.
+    const generation = row.generation
     await setIndexState(db, s1, AUTHOR, true, null)
-    assert.equal((await readControl(db)).firstFillDone, false)
+    assert.equal((await readControl(db)).generation, generation)
     await upkeep.run()
     row = await readControl(db)
     assert.equal(row.firstFillDone, true)
     // The refill reads the stored records, which never had the edit, so it differs from today's index until that is projected too.
     assert.equal(row.pgVerified, false)
     await projector.projectSidecar(s1)
+    await db.query('update search_control set compared_at = null')
+    await upkeep.run()
+    assert.equal((await readControl(db)).pgVerified, true)
+  })
+
+  it('clears verification when old code changes records or accounts, even if it fails before index_state', async () => {
+    const upkeep = new SearchUpkeep(db, projector, () => {})
+    await db.query('update search_control set compared_at = null')
+    await upkeep.run()
+    assert.equal((await readControl(db)).pgVerified, true)
+    for (const sql of [`update accounts set active = false where did = '${AUTHOR}'`, `update records set updated_at = now() where did = '${AUTHOR}'`]) {
+      await db.query('update search_control set pg_verified = true, first_fill_done = true')
+      const before = (await readControl(db)).generation
+      const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+      await old.connect()
+      await old.query('begin')
+      await old.query(sql)
+      await old.query('commit')
+      await old.end()
+      const row = await readControl(db)
+      assert.equal(row.pgVerified, false, sql)
+      assert.equal(row.firstFillDone, false, sql)
+      assert.notEqual(row.generation, before, sql)
+    }
+    await db.query(`update accounts set active = true where did = '${AUTHOR}'`)
     await db.query('update search_control set compared_at = null')
     await upkeep.run()
     assert.equal((await readControl(db)).pgVerified, true)

@@ -87,6 +87,10 @@ export class ElasticBackend implements SearchBackend {
 
   async get(uri: string, opts: CallOptions = {}): Promise<EventDoc | undefined> {
     const res = await this.es.get<EventDoc>({ index: this.index, id: uri }, { ignore: [404], ...opts })
+    // A 404 for a missing index is the index being unavailable, not "no such
+    // event": throwing lets routing fall back to a verified Postgres.
+    const error = (res as unknown as { error?: { type?: string } }).error
+    if (error) throw new Error(`Elasticsearch: ${error.type ?? 'error'} on get`)
     return res.found ? res._source : undefined
   }
 

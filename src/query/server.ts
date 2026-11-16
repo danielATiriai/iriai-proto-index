@@ -131,14 +131,18 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
       elasticCursorsUntil: row.elasticCursorsUntil.toISOString(),
     }
   } catch {
+    // Unreadable search_control counts as unverified, as in routing, so
+    // health still asks the backend that would serve.
     out.search = { unavailable: true }
+    backend = route(search.force, { pgVerified: false })?.backend
   }
   // Elasticsearch not answering within 2 seconds hands new sessions to a
   // verified Postgres, so health reports Postgres then, as routing does.
   if (!backend) out.index = { ok: false }
   else if (backend === 'postgres') out.index = await countOn(search.postgres)
   else {
-    out.index = await countOn(search.elastic, { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) })
+    // The 2-second limit applies only once Postgres is verified, as in routing.
+    out.index = await countOn(search.elastic, pgVerified ? { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) } : {})
     if (!(out.index as { ok: boolean }).ok && pgVerified) {
       out.index = { ...(await countOn(search.postgres)), fallback: 'Elasticsearch did not answer; new sessions go to Postgres' }
     }

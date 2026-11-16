@@ -65,7 +65,7 @@ function view(doc: EventDoc): EventView {
  */
 async function routed<T>(search: Search, run: (backend: SearchBackend, opts: CallOptions) => Promise<T>): Promise<T> {
   // Read fresh every time (one row by key): a cleared verification takes effect at once.
-  const row: Pick<ControlRow, 'pgVerified'> = await search.control.refresh().catch(() => ({ pgVerified: false }))
+  const row = await verification(search)
   const chosen = route(search.force, row)
   if (!chosen) throw new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable: Postgres is not verified yet')
   if (chosen.backend === 'postgres') {
@@ -80,6 +80,28 @@ async function routed<T>(search: Search, run: (backend: SearchBackend, opts: Cal
     if (!row.pgVerified) throw toUnavailable(err)
     search.last = { backend: 'postgres', reason: 'Elasticsearch failed or took over 2 s; Postgres verified', at: new Date().toISOString() }
     return unavailableOnFailure(() => run(search.postgres, {}))
+  }
+}
+
+/** A control read that stalls is cut off after this long and counts as unverified. */
+export const CONTROL_READ_MS = 500
+
+/**
+ * search_control read fresh, bounded to 500 ms: a read that fails or stalls
+ * counts as Postgres unverified, so Elasticsearch still serves as before.
+ */
+export async function verification(search: Pick<Search, 'control'>): Promise<Pick<ControlRow, 'pgVerified'>> {
+  let timer: NodeJS.Timeout | undefined
+  const unverified = { pgVerified: false }
+  try {
+    return await Promise.race([
+      search.control.refresh().catch(() => unverified),
+      new Promise<typeof unverified>((resolve) => {
+        timer = setTimeout(() => resolve(unverified), CONTROL_READ_MS)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
   }
 }
 

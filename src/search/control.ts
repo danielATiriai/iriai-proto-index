@@ -2,7 +2,7 @@ import type { Db } from '../db.js'
 import type { BackendName } from './backend.js'
 
 export interface ControlRow {
-  /** Moved on by every change to index_state from code that does not write event_docs. */
+  /** Moved on by every change to an ingestion table from code that does not write event_docs. */
   generation: string
   elasticCursorsUntil: Date
   firstFillDone: boolean
