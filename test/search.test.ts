@@ -2,7 +2,7 @@ import { after, before, beforeEach, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
-import type { Db } from '../src/db.js'
+import { migrate, type Db } from '../src/db.js'
 import type { EventDoc } from '../src/index/assemble.js'
 import { ElasticBackend, connectElastic, ensureIndex, type Elastic } from '../src/index/elastic.js'
 import { Handler, type JetstreamEvent } from '../src/ingest/handler.js'
@@ -150,6 +150,36 @@ describe('Postgres search backend', { skip: !databaseUrl && 'TEST_DATABASE_URL n
       }
     }
     assert.ok(checked > 100)
+  })
+
+  it('stores, filters and pages start times in any year the API accepts, 0000 included', async () => {
+    const at = (n: number, startsAt: string) => ({ ...doc(n), startsAt, endsAt: undefined })
+    await pg.put(at(1, '0000-01-01T00:00:00.000Z'))
+    await pg.put(at(2, '0001-06-01T12:00:00.500Z'))
+    await pg.put(at(3, '2026-10-16T01:30:00.123Z'))
+    const snapshot = await pg.openSnapshot()
+    const windowed = await pg.page(snapshot, q('windowStart=0000-01-01T00:00:00Z&windowEnd=0002-01-01T00:00:00Z&sort=startsAt'), undefined, 10)
+    assert.deepEqual(windowed.hits.map((h) => h.doc.uri), [uriOf(1), uriOf(2)])
+    const first = await pg.page(snapshot, q('sort=startsAt&limit=1'), undefined, 1)
+    assert.equal(first.hits[0].sort[0], Date.parse('0000-01-01T00:00:00.000Z'))
+    const rest = await pg.page(snapshot, q('sort=startsAt&limit=1'), first.hits[0].sort, 10)
+    assert.deepEqual(rest.hits.map((h) => h.doc.uri), [uriOf(2), uriOf(3)])
+    const next = await pg.page(snapshot, q('sort=startsAt&limit=1'), rest.hits[0].sort, 10)
+    assert.deepEqual(next.hits.map((h) => h.doc.uri), [uriOf(3)], 'millisecond-exact keyset')
+  })
+
+  it('gives up waiting for a search connection after 2 seconds when all five are busy', async () => {
+    const pool = searchPool(dbUrl('pg_search_test'))
+    try {
+      const held = await Promise.all(Array.from({ length: 5 }, () => pool.connect()))
+      const started = Date.now()
+      await assert.rejects(new PostgresBackend(db, pool).count(), /timeout/)
+      const waited = Date.now() - started
+      assert.ok(waited >= 1_900 && waited < 2_600, `gave up after ${waited} ms`)
+      for (const c of held) c.release()
+    } finally {
+      await pool.end()
+    }
   })
 
   it('deletes closed rows 61 minutes after they closed, and not before', async () => {
@@ -327,6 +357,40 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
                 compared++
               }
     assert.ok(compared >= 90, `${compared} combinations`)
+  })
+
+  it('keeps serving getEvent from Elasticsearch when search_control cannot be read', async () => {
+    const broken = { current: async () => Promise.reject(new Error('connect ECONNREFUSED')), refresh: async () => Promise.reject(new Error('down')) } as unknown as SearchControl
+    const res = await getEvent({ ...deps, search: { ...search, control: broken } }, uriOf(2))
+    assert.equal(res.value.uri, uriOf(2))
+  })
+
+  it('waits for a slow Elasticsearch as before while Postgres is not verified', async () => {
+    await setVerified(false)
+    const slow = {
+      name: 'elastic',
+      get: async (uri: string, opts: { signal?: AbortSignal } = {}) => {
+        assert.equal(opts.signal, undefined, 'no 2-second limit before verification')
+        await new Promise((r) => setTimeout(r, 2_300))
+        return search.elastic.get(uri)
+      },
+    } as unknown as ElasticBackend
+    const res = await getEvent({ ...deps, search: { ...search, elastic: slow } }, uriOf(2))
+    assert.equal(res.value.uri, uriOf(2))
+    await setVerified(true)
+  })
+
+  it('answers ServiceUnavailable, not an error, when today\'s index does not exist yet', async () => {
+    await setVerified(false)
+    const missing = new ElasticBackend(es, `${INDEX}-missing`)
+    await assert.rejects(ask(PARAMS, undefined, { ...deps, search: { ...search, elastic: missing } }), unavailable)
+    await setVerified(true)
+  })
+
+  it('covers cursors from a previous deployment when it starts', async () => {
+    await db.query(`update search_control set elastic_cursors_until = now() - interval '5 minutes'`)
+    await migrate(db)
+    assert.ok((await readControl(db)).elasticCursorsUntil.getTime() >= Date.now() + 60 * 60_000)
   })
 
   it('falls back without waiting for Elasticsearch to close a snapshot', async () => {

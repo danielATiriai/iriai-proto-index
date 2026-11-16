@@ -98,6 +98,8 @@ create table if not exists event_docs (
 
 -- [s, s] for an event without an end, [s, e) when it ends after it starts,
 -- otherwise null: the time-window semantics of the Elasticsearch filter.
+-- The GiST indexes below are built from this body: changing it needs a
+-- reindex of event_docs_current_span and event_docs_closed_span.
 create or replace function event_span(s timestamptz, e timestamptz) returns tstzrange
   language sql immutable parallel safe as $fn$
   select case
@@ -140,7 +142,10 @@ create table if not exists search_control (
   note text,
   updated_at timestamptz not null default now()
 );
-insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes') on conflict do nothing;
+-- Every start covers the hour of Elasticsearch cursors that a previous
+-- deployment (which may not have recorded them) could have issued.
+insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes')
+  on conflict (id) do update set elastic_cursors_until = greatest(search_control.elastic_cursors_until, excluded.elastic_cursors_until);
 
 -- Code that changes index_state without writing event_docs (this service
 -- before search on Postgres, say after a revert) leaves event_docs stale. Any

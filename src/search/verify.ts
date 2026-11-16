@@ -78,7 +78,9 @@ export class SearchUpkeep {
             .filter(Boolean)
             .join('; ')
     } catch (err) {
-      note = `comparison could not run: ${(err as Error).message}`
+      // Health is public, so the note says what happened, not the error text.
+      this.log(`search: comparison could not run: ${(err as Error).message}`)
+      note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying in an hour'
     }
     await this.db.query(
       `update search_control set pg_verified = pg_verified or $1, compared_at = now(), note = $2, updated_at = now() where id = 1`,

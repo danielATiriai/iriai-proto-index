@@ -18,7 +18,14 @@ const SEARCH_POOL_SIZE = 5
  * timeout, so a slow search cannot take ingestion's connections (spec 4.4).
  */
 export function searchPool(databaseUrl: string, log: (msg: string) => void = console.error): Db {
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: SEARCH_POOL_SIZE, statement_timeout: SEARCH_TIMEOUT_MS })
+  // A search waits at most 2 s for a connection as well, so requests cannot
+  // pile up behind five slow searches.
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    max: SEARCH_POOL_SIZE,
+    statement_timeout: SEARCH_TIMEOUT_MS,
+    connectionTimeoutMillis: SEARCH_TIMEOUT_MS,
+  })
   pool.on('error', (err) => log(`postgres (search): idle client lost: ${err.message}`))
   return pool
 }
@@ -41,7 +48,7 @@ export class PostgresBackend implements SearchBackend {
     return this.write(doc.uri, async (client, version) => {
       await client.query(
         `insert into event_docs (uri, version, did, event_uri, doc, lat, lon, starts_at, ends_at, time_valid)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+         values ($1, $2, $3, $4, $5, $6, $7, ${FROM_MS('$8')}, ${FROM_MS('$9')}, $10)`,
         [
           doc.uri,
           version,
@@ -50,8 +57,8 @@ export class PostgresBackend implements SearchBackend {
           JSON.stringify(doc),
           doc.point?.lat ?? null,
           doc.point?.lon ?? null,
-          doc.startsAt ?? null,
-          doc.endsAt ?? null,
+          ms(doc.startsAt),
+          ms(doc.endsAt),
           doc.timeValid,
         ],
       )
@@ -127,7 +134,7 @@ export class PostgresBackend implements SearchBackend {
     const res = await this.reads.query<{ doc: EventDoc; k: number | Date | null; uri: string }>(text, values)
     const hits = res.rows.map((r) => ({
       doc: r.doc,
-      sort: q.sort === 'uri' ? [r.uri] : [r.k instanceof Date ? r.k.toISOString() : r.k, r.uri],
+      sort: q.sort === 'uri' ? [r.uri] : [r.k === null ? null : Number(r.k), r.uri],
     }))
     return { hits, snapshot }
   }
@@ -154,6 +161,17 @@ export class PostgresBackend implements SearchBackend {
     return new Map(res.rows.map((r) => [r.uri, r.doc]))
   }
 }
+
+/** An ISO time as epoch milliseconds, for binding; undefined stays null. */
+function ms(iso: string | undefined): string | null {
+  if (iso === undefined) return null
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) throw new Error(`not a time: ${iso}`)
+  return String(t)
+}
+
+/** SQL for a timestamptz from a bound epoch-milliseconds parameter (exact integer arithmetic). */
+const FROM_MS = (param: string) => `(timestamptz 'epoch' + ${param}::bigint * interval '1 millisecond')`
 
 /**
  * The page query (spec 4.3, 4.4): rows visible at snapshot W, from a branch
@@ -194,7 +212,7 @@ export function pageSql(snapshot: string, q: EventQuery, after: unknown[] | unde
   const windowed = Boolean(q.windowStart || q.windowEnd)
   if (windowed) {
     filters.push(
-      `time_valid and event_span(starts_at, ends_at) && tstzrange(${p(q.windowStart ?? null, '::timestamptz')}, ${p(q.windowEnd ?? null, '::timestamptz')}, '[)')`,
+      `time_valid and event_span(starts_at, ends_at) && tstzrange(${FROM_MS(p(ms(q.windowStart)))}, ${FROM_MS(p(ms(q.windowEnd)))}, '[)')`,
     )
   }
   if (q.author) filters.push(`did = any(${p(q.author, '::text[]')})`)
@@ -206,12 +224,15 @@ export function pageSql(snapshot: string, q: EventQuery, after: unknown[] | unde
     if (!key) filters.push(`uri > ${afterUri}`)
     else if (after[0] === null || after[0] === undefined) filters.push(`(${key} is null and uri > ${afterUri})`)
     else {
-      const k = p(after[0], q.sort === 'distance' ? '::float8' : '::timestamptz')
+      const k = q.sort === 'distance' ? p(after[0], '::float8') : FROM_MS(p(after[0]))
       filters.push(`(${key} > ${k} or (${key} = ${k} and uri > ${afterUri}) or ${key} is null)`)
     }
   }
 
-  const select = `select uri, doc, ${key ?? 'null'} as k from event_docs`
+  // Start times travel as epoch milliseconds: exact, and valid for any year
+  // the API accepts, including 0000, which timestamptz text input refuses.
+  const keyOut = q.sort === 'startsAt' ? `(extract(epoch from starts_at) * 1000)::bigint` : key
+  const select = `select uri, doc, ${keyOut ?? 'null'} as k from event_docs`
   const where = (visible: string) => [visible, ...filters].join(' and ')
   const current = `closed_version is null and version <= ${w}`
   const closed = `closed_version is not null and version <= ${w} and closed_version > ${w}`

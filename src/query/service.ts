@@ -7,7 +7,7 @@ import { getRecord, incompleteAmong } from '../ingest/store.js'
 import { CursorError, bindingHash, decodeCursor, encodeCursor } from './cursor.js'
 import { InvalidRequest, bindingOf, type EventQuery } from './params.js'
 import type { BackendName, CallOptions, Hit, SearchBackend } from '../search/backend.js'
-import { route, type Route, type SearchControl } from '../search/control.js'
+import { route, type ControlRow, type Route, type SearchControl } from '../search/control.js'
 
 export class XrpcError extends Error {
   constructor(
@@ -57,12 +57,14 @@ function view(doc: EventDoc): EventView {
 
 /**
  * Routes a new session or a getEvent: the chosen backend if it may serve,
- * else Postgres if verified, else ServiceUnavailable. Elasticsearch failing
- * within 2 seconds counts as not serving, so Postgres takes the request if it
- * is verified.
+ * else Postgres if verified, else ServiceUnavailable. Once Postgres is
+ * verified, Elasticsearch failing within 2 seconds counts as not serving and
+ * Postgres takes the request; until then Elasticsearch behaves exactly as
+ * today, with its own timeouts. If search_control cannot be read, Postgres
+ * counts as unverified, so Elasticsearch still serves as before.
  */
 async function routed<T>(search: Search, run: (backend: SearchBackend, opts: CallOptions) => Promise<T>): Promise<T> {
-  const row = await unavailableOnFailure(() => search.control.current())
+  const row: Pick<ControlRow, 'pgVerified'> = await search.control.current().catch(() => ({ pgVerified: false }))
   const chosen = route(search.force, row)
   if (!chosen) throw new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable: Postgres is not verified yet')
   if (chosen.backend === 'postgres') {
@@ -70,12 +72,12 @@ async function routed<T>(search: Search, run: (backend: SearchBackend, opts: Cal
     return unavailableOnFailure(() => run(search.postgres, {}))
   }
   try {
-    const result = await run(search.elastic, { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) })
+    const result = await run(search.elastic, row.pgVerified ? { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) } : {})
     search.last = { ...chosen, at: new Date().toISOString() }
     return result
   } catch (err) {
     if (!row.pgVerified) throw toUnavailable(err)
-    search.last = { backend: 'postgres', reason: `Elasticsearch failed (${(err as Error).message}); Postgres verified`, at: new Date().toISOString() }
+    search.last = { backend: 'postgres', reason: 'Elasticsearch failed or took over 2 s; Postgres verified', at: new Date().toISOString() }
     return unavailableOnFailure(() => run(search.postgres, {}))
   }
 }
@@ -190,7 +192,9 @@ function isClientError(err: unknown): boolean {
 
 /** Elasticsearch or Postgres failing is the index being unavailable; an Elasticsearch 4xx stays an error. */
 function toUnavailable(err: unknown): unknown {
-  if (err instanceof XrpcError || isClientError(err)) return err
+  if (err instanceof XrpcError) return err
+  // A missing index (a fresh environment before the ingester's first write) is the index being unavailable.
+  if (isClientError(err) && !JSON.stringify((err as errors.ResponseError).body ?? '').includes('index_not_found_exception')) return err
   return new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable')
 }
 

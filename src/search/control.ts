@@ -96,7 +96,7 @@ export interface Route {
  * verified, else nothing. Today's index may serve throughout PR 1, since it is
  * written as before; Postgres may serve once verified.
  */
-export function route(force: BackendName, row: ControlRow): Route | undefined {
+export function route(force: BackendName, row: Pick<ControlRow, 'pgVerified'>): Route | undefined {
   if (force === 'elastic') return { backend: 'elastic', reason: 'SEARCH_BACKEND_FORCE=elastic (default)' }
   if (row.pgVerified) return { backend: 'postgres', reason: 'SEARCH_BACKEND_FORCE=postgres, Postgres verified' }
   return undefined

@@ -101,12 +101,13 @@ export class Ingester {
     this.handler.remember(await knownDids(this.db))
     this.handler.remember(this.settings.approvedAccounts)
     this.timers.push(setInterval(() => void this.flush(), FLUSH_MS))
-    this.timers.push(setInterval(() => this.enqueue(() => this.retry()), RETRY_MS))
-    this.timers.push(setInterval(() => this.enqueue(() => this.upkeep.run()), UPKEEP_MS))
-    // The first fill runs before anything else writes, so no change races it.
+    // The first fill and the comparison run before anything else writes, so
+    // no change races them; the retry and upkeep timers start only after.
     await this.upkeep.run()
     // Before the stream, so the stream's replay lands on top of the listing.
     await this.backfill()
+    this.timers.push(setInterval(() => this.enqueue(() => this.retry()), RETRY_MS))
+    this.timers.push(setInterval(() => this.enqueue(() => this.upkeep.run()), UPKEEP_MS))
     await this.connect()
   }
 
