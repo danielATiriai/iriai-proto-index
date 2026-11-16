@@ -1,10 +1,10 @@
 {
  "proposal": "search-without-elasticsearch",
- "version": "v11",
+ "version": "v12",
  "spec": "spec",
- "build": "facd495",
+ "build": "4b20e13",
  "specFile": "spec.md",
- "specSha": "1b8cc9219ac3c05b0917766bc864bc587d63a2ea83320da64cda9e9ddc03faea",
+ "specSha": "95de4ff1faafdd4fef52a5f7b4350df43a0c5396ab256c7e4c5f5d2470e4d2dc",
  "decisions": [
   {
    "id": "D1",
@@ -110,6 +110,15 @@
    }
   ],
   "rel": {
+   "notWith": [
+    {
+     "opt": "D3 B",
+     "when": [
+      "D2 hold"
+     ],
+     "why": "B's Railway token exists only so the controller can turn Elasticsearch on and off; with D2 held there is no controller."
+    }
+   ],
    "mootWhen": [
     {
      "dec": "D2",

@@ -1,6 +1,6 @@
 # Event search on Postgres until scale: technical specification
 
-Draft v11, 2026-11-16 (v1 to v7 reviewed; v7 to v10 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
+Draft v12, 2026-11-16 (v1 to v7 reviewed; v7 to v11 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
 
 ## 1. Goal and scope
 
@@ -37,7 +37,7 @@ export interface SearchBackend {
 }
 ```
 
-The cursor gains one sealed field, `be` (`'postgres'` or `'elastic'`); cursors without it are read as `'elastic'`. A Postgres cursor is always accepted. An Elasticsearch cursor is sent to Elasticsearch only before `elastic_cursors_until`; after it, it answers `CursorExpired`, so an old cursor never wakes a sleeping Elasticsearch. Every Elasticsearch first page moves `elastic_cursors_until` to at least now + 61 minutes (one row update, at most once a minute), and PR 1's migration sets it to the deploy time + 61 minutes for cursors issued before it. No session lasts over an hour, so this field covers every open Elasticsearch session; it governs when use may end (5.2), and each index's own retirement time governs its deletion (5.4). `CursorExpired` is an error clients already handle by searching again.
+The cursor gains one sealed field, `be` (`'postgres'` or `'elastic'`); cursors without it are read as `'elastic'`. A Postgres cursor is always accepted. An Elasticsearch cursor is sent to Elasticsearch only before `elastic_cursors_until`; after it, it answers `CursorExpired`, so an old cursor never wakes a sleeping Elasticsearch. Every Elasticsearch first page moves `elastic_cursors_until` to at least now + 61 minutes (one row update, at most once a minute), and PR 1's migration sets it to the deploy time + 61 minutes for cursors issued before it. No session lasts over an hour, so this field covers every open Elasticsearch session; it governs when use may end (5.2), and so when an index may be deleted (5.4). `CursorExpired` is an error clients already handle by searching again.
 
 `getEvent` follows the same rule as `queryEvents` (5.2).
 
@@ -120,7 +120,7 @@ Table and indexes: 14 MB at 10,000 events, 133 MB at 100,000, 1.33 GB at 1,000,0
 Every `put` and `remove` goes to Postgres first, which gives it its version. Elasticsearch is then written in one of two ways:
 
 - PR 1, today's index: the write goes to it exactly as today, with Elasticsearch's own versions; a failure fails the event, which is replayed. Today's index stays as current as it is today, and an Elasticsearch outage stalls ingestion, as today.
-- PR 2, a managed index: only while Elasticsearch is in use (5.2), with `version_type: external` and the Postgres version, so an older write never replaces a newer one; a version conflict (409) counts as success. A failure never fails the event: its `es_pending` row (4.2) stays and is replayed. A managed index is always built from Postgres (5.4), so Elasticsearch's own version numbers are never compared with Postgres's. PR 2 stops writing today's index.
+- PR 2, a managed index: only while Elasticsearch is in use (5.2), with `version_type: external` and the Postgres version, so an older write never replaces a newer one, and with `refresh=wait_for`, so a write counts as confirmed only once it is searchable; a version conflict (409) counts as success once a refresh of the index has returned. Replays (5.2) follow the same rule. A failure never fails the event: its `es_pending` row (4.2) stays and is replayed. A managed index is always built from Postgres (5.4), so Elasticsearch's own version numbers are never compared with Postgres's. PR 2 stops writing today's index.
 
 ### 5.2 Elasticsearch is optional
 
@@ -132,7 +132,7 @@ The Elasticsearch client connects lazily; neither role waits for it at start-up.
 - Elasticsearch is in use while `SEARCH_ES=on` on the ingester (default `on`) or the controller is in `starting` to `draining`. While in use, the ingester writes to it (5.1) and every 2 minutes sends a cluster-health request (recording `es_seen_at`) and replays `es_pending` rows older than 2 s, and once at start-up. When use begins and `es_current` is clear, the ingester builds a managed index (5.4) and then sets `es_current`. Use ends only once `elastic_cursors_until` has passed; the ingester then clears `es_current` and `es_pending` and sends nothing more. Use cannot end before Postgres is verified: until then the ingester ignores `SEARCH_ES=off`, opens an issue and says so in health (`SEARCH_ES` and issues both arrive in PR 2).
 - A new session goes to the chosen backend (the state, or `SEARCH_BACKEND_FORCE`) if it may serve, else to Postgres if verified, else answers `ServiceUnavailable`; a first page Elasticsearch fails within 2 seconds is answered the same way. Health reports which backend served and why.
 
-Cost of the rule: until Postgres is verified, Elasticsearch serves alone and behaves exactly as today, failures and outages included; a switch to Elasticsearch waits for a full build; any unconfirmed write hands new sessions to Postgres until replayed (every 2 minutes while Elasticsearch answers, so for as long as an outage lasts); a new Elasticsearch session can miss a write from the last 2 seconds; while in use, every write also inserts and deletes one `es_pending` row.
+Cost of the rule: until Postgres is verified, Elasticsearch serves alone and behaves exactly as today, failures and outages included; a switch to Elasticsearch waits for a full build; any unconfirmed write hands new sessions to Postgres until replayed (every 2 minutes while Elasticsearch answers, so for as long as an outage lasts); a new Elasticsearch session can miss a write from the last 2 seconds; while in use, every write also inserts and deletes one `es_pending` row and waits for Elasticsearch's refresh, up to about a second.
 
 ### 5.3 Health
 
@@ -140,7 +140,7 @@ Cost of the rule: until Postgres is verified, Elasticsearch serves alone and beh
 
 ### 5.4 First fill and rebuild
 
-On first start after PR 1 deploys, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done; meanwhile today's index serves, as today. A managed index is built whenever Elasticsearch use begins with `es_current` clear, including at the PR 2 deploy while `SEARCH_ES` is still `on`: a fresh index `placeproto-events-<n>` (n a counter in `search_control`, raised per build) with today's mapping and `index.gc_deletes` 2 hours; every current row copied, 500 per bulk request, with external versions; then reconciled (6.4). Each index records when new sessions stopped going to it (`retired_at`): today's index at the PR 2 deploy, a managed index when `es_current` is cleared or another index replaces it, a candidate when its build fails. At every tick while Elasticsearch is in use, an index retired more than 61 minutes ago is deleted; no session lasts an hour, so no open session loses its index. At most two indexes exist: the current or last one, and one retired.
+On first start after PR 1 deploys, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done; meanwhile today's index serves, as today. A managed index is built whenever Elasticsearch use begins with `es_current` clear, including at the PR 2 deploy while `SEARCH_ES` is still `on`: a fresh index `placeproto-events-<n>` (n a counter in `search_control`, raised per build) with today's mapping and `index.gc_deletes` 2 hours; every current row copied, 500 per bulk request, with external versions; then reconciled (6.4). An index is deleted only when no open session can reach it. A managed index is deleted when use ends, which waits for `elastic_cursors_until` (5.2), and a failed candidate at once, since no session used it. Today's index is kept until 61 minutes after the PR 2 deploy, then deleted. When use begins, any other leftover index (one Elasticsearch could not delete at the time) is deleted before the build. So, apart from the hour after PR 2 (today's index and one managed index), at most one index exists, and none while Elasticsearch is off.
 
 ## 6. The scale controller
 
@@ -169,7 +169,7 @@ On when the current events number 500,000 or more on any day. Timeouts are recor
 <!-- dp D3 -->
 Railway Serverless is turned on for the Elasticsearch service once (Daniel's sentence). From then on, turning Elasticsearch on, and the $13 to $20 a month it costs while on, happens without his word, as he asked. Railway puts a Serverless service to sleep 5 to 10 minutes after it last sent any outbound packet, and bills nothing for compute while it sleeps; a request to it wakes it [docs: Railway Serverless; that a request over private networking wakes it, and that Elasticsearch sends nothing on its own when idle, are checked in gate 2, with `ingest.geoip.downloader.enabled=false` set]. "On" is Elasticsearch in use (5.2): its answers to the health request every 2 minutes keep it awake. "Off" is nothing in use, so nothing is sent. No Railway credential is held by our code, so our code cannot see whether Elasticsearch is asleep: the check is a weekly scheduled routine that this thread creates at gate 2: it reads Elasticsearch's memory on Railway (read-only, Railway connector) and opens an issue when it is non-zero while Elasticsearch is not in use. Gate 2 also checks that a sleeping service with a volume stops cleanly and keeps its data. While it sleeps, its image and its old index stay as they were; the backfill always builds a fresh index.
 <!-- opt B -->
-The ingester holds a Railway project token for placeproto / production, created only if D2 builds a controller; with D2 held, the rollout removal is Daniel's sentence and no token exists. It deploys the Elasticsearch service with `serviceInstanceDeployV2` and removes its active deployment with `deploymentRemove`. Our code calls only the service named in `SEARCH_ES_SERVICE_ID`, but the token itself can read and change every service, variable and volume in that environment, including Postgres and its password. This replaces Daniel's sentence (Eng directions §3) for these two actions with a standing authorization. If the token is revoked or stops working, each on or off attempt fails and opens an issue (6.4); Daniel then deploys or removes by sentence, and moving to C is a code change.
+The ingester holds a Railway project token for placeproto / production. B needs the controller, so it is not possible with D2 held. It deploys the Elasticsearch service with `serviceInstanceDeployV2` and removes its active deployment with `deploymentRemove`. Our code calls only the service named in `SEARCH_ES_SERVICE_ID`, but the token itself can read and change every service, variable and volume in that environment, including Postgres and its password. This replaces Daniel's sentence (Eng directions §3) for these two actions with a standing authorization. If the token is revoked or stops working, each on or off attempt fails and the controller opens an issue each hour (6.4) until the token works again or the mechanism moves to C, a code change; meanwhile Daniel deploys or removes by sentence.
 <!-- opt C -->
 The controller opens a GitHub issue and waits. Daniel types "Turn on Elasticsearch for query.iriai.app" (or "Turn off …") in a thread, which deploys the service or removes its deployment. The controller sees the result and goes on by itself. No Railway credential is held by our code.
 <!-- /dp -->
@@ -190,7 +190,7 @@ off → ready → starting → backfilling → verifying → on → draining →
 <!-- dp D3 -->
 Turning off under Serverless is ending use; the weekly check (6.3) confirms the sleep.
 <!-- opt B -->
-Turning off is removing the deployment; the controller confirms, through Railway's API or by the cluster not answering for 30 minutes, that none is active, retries every tick until then, and raises an issue each hour it fails.
+Turning off is removing the deployment; the controller confirms through Railway's API, and only through it, that none is active, retries every tick until then, and raises an issue each hour it fails.
 <!-- opt C -->
 Turning off is an issue asking Daniel for "Turn off Elasticsearch for query.iriai.app"; the controller re-asks each day until the cluster stops answering.
 <!-- /dp -->
@@ -228,7 +228,7 @@ Prices: $10 per GB of memory a month and $20 per vCPU a month [docs]; volumes ab
 <!-- dp D3 -->
 - No Railway credential.
 <!-- opt B -->
-- `RAILWAY_PROJECT_TOKEN`, `SEARCH_ES_SERVICE_ID`, `SEARCH_ENV_ID` (ingester), the token created by Daniel and stored with the secrets helper, only if D2 builds a controller.
+- `RAILWAY_PROJECT_TOKEN`, `SEARCH_ES_SERVICE_ID`, `SEARCH_ENV_ID` (ingester), the token created by Daniel and stored with the secrets helper.
 <!-- opt C -->
 - No Railway credential.
 <!-- /dp -->
