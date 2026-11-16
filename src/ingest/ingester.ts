@@ -101,8 +101,10 @@ export class Ingester {
     this.handler.remember(await knownDids(this.db))
     this.handler.remember(this.settings.approvedAccounts)
     this.timers.push(setInterval(() => void this.flush(), FLUSH_MS))
-    // The first fill and the comparison run before anything else writes, so
-    // no change races them; the retry and upkeep timers start only after.
+    // The first fill and the comparison run before this ingester writes
+    // anything (another ingester, during a deploy, may still write: the
+    // generation and the write lock cover that); the retry and upkeep timers
+    // start only after.
     await this.upkeep.run()
     // Before the stream, so the stream's replay lands on top of the listing.
     await this.backfill()

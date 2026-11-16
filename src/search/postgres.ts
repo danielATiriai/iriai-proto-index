@@ -1,5 +1,5 @@
 import pg from 'pg'
-import type { Db } from '../db.js'
+import { checkout, type Db } from '../db.js'
 import type { EventDoc } from '../index/assemble.js'
 import type { EventQuery } from '../query/params.js'
 import type { Hit, SearchBackend } from './backend.js'
@@ -86,7 +86,7 @@ export class PostgresBackend implements SearchBackend {
     insert: (client: pg.PoolClient, version: string) => Promise<void>,
     prepare?: (client: pg.PoolClient) => Promise<void>,
   ): Promise<bigint> {
-    const client = await this.db.connect()
+    const client = await checkout(this.db)
     try {
       await client.query('begin')
       await client.query('select pg_advisory_xact_lock($1)', [WRITE_LOCK])
@@ -122,7 +122,7 @@ export class PostgresBackend implements SearchBackend {
    * number above it. No clock is involved.
    */
   async openSnapshot(): Promise<string> {
-    const client = await this.reads.connect()
+    const client = await checkout(this.reads)
     try {
       await client.query('begin')
       await client.query('select pg_advisory_xact_lock_shared($1)', [WRITE_LOCK])
@@ -152,9 +152,21 @@ export class PostgresBackend implements SearchBackend {
 
   async closeSnapshot(): Promise<void> {}
 
+  /** Current documents, after the same shared lock a first page's snapshot waits for. */
   async count(): Promise<number> {
-    const res = await this.reads.query<{ n: string }>('select count(*) as n from event_docs where closed_version is null')
-    return Number(res.rows[0].n)
+    const client = await checkout(this.reads)
+    try {
+      await client.query('begin')
+      await client.query('select pg_advisory_xact_lock_shared($1)', [WRITE_LOCK])
+      const res = await client.query<{ n: string }>('select count(*) as n from event_docs where closed_version is null')
+      await client.query('commit')
+      return Number(res.rows[0].n)
+    } catch (err) {
+      await client.query('rollback').catch(() => {})
+      throw err
+    } finally {
+      client.release()
+    }
   }
 
   /** Deletes rows closed more than 61 minutes ago; no session can still read them. */

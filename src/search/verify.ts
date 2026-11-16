@@ -1,4 +1,4 @@
-import type { Db } from '../db.js'
+import { checkout, type Db } from '../db.js'
 import type { EventDoc } from '../index/assemble.js'
 import type { Projector } from '../ingest/projector.js'
 import { readControl } from './control.js'
@@ -7,6 +7,8 @@ const COMPARE_EVERY_MS = 60 * 60_000
 const LISTED = 5
 /** Held by the ingester running upkeep. */
 export const UPKEEP_LOCK = 7140016
+/** How long a fill or comparison waits for transactions open when it read the generation. */
+export const SETTLE_MS = 30_000
 
 /**
  * The ingester's search upkeep for PR 1 (spec 4.2, 5.2, 5.4), run at start-up
@@ -20,6 +22,8 @@ export const UPKEEP_LOCK = 7140016
  * or the generation moves.
  */
 export class SearchUpkeep {
+  settleMs = SETTLE_MS
+
   constructor(
     private db: Db,
     private projector: Projector,
@@ -35,23 +39,27 @@ export class SearchUpkeep {
   async run(): Promise<void> {
     let client
     try {
-      client = await this.db.connect()
+      client = await checkout(this.db)
     } catch (err) {
       this.log(`search upkeep: ${(err as Error).message}`)
       return
     }
+    // A connection that may still hold the lock is destroyed, not pooled,
+    // which ends its session and so releases the lock.
+    let holds = false
     try {
-      const got = (await client.query<{ ok: boolean }>('select pg_try_advisory_lock($1) as ok', [UPKEEP_LOCK])).rows[0].ok
-      if (!got) return
+      holds = (await client.query<{ ok: boolean }>('select pg_try_advisory_lock($1) as ok', [UPKEEP_LOCK])).rows[0].ok
+      if (!holds) return
       try {
         await this.runLocked()
       } finally {
-        await client.query('select pg_advisory_unlock($1)', [UPKEEP_LOCK]).catch(() => {})
+        holds = !(await client.query<{ ok: boolean }>('select pg_advisory_unlock($1) as ok', [UPKEEP_LOCK])).rows[0].ok
       }
     } catch (err) {
+      holds = true
       this.log(`search upkeep: ${(err as Error).message}`)
     } finally {
-      client.release()
+      client.release(holds ? new Error('upkeep lock not confirmed released') : undefined)
     }
   }
 
@@ -82,10 +90,14 @@ export class SearchUpkeep {
   /**
    * Projects every sidecar in index_state into Postgres, then records that
    * the first fill is done, unless code that does not write event_docs
-   * changed an ingestion table meanwhile (the generation moved): then it runs again.
+   * changed an ingestion table meanwhile (the generation moved): then it runs
+   * again. It reads nothing until every write that moved the generation to
+   * the value it read is visible (settle). The comparison needs no such wait:
+   * it publishes only at the fill's generation, unmoved.
    */
   async firstFill(): Promise<number> {
     const { generation } = await readControl(this.db)
+    await this.settle()
     const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
     for (const uri of uris) await this.projector.fillPostgres(uri)
     const res = await this.db.query(
@@ -129,7 +141,7 @@ export class SearchUpkeep {
     } catch (err) {
       // Health is public, so the note says what happened, not the error text.
       this.log(`search: comparison could not run: ${(err as Error).message}`)
-      note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying in an hour'
+      note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying at the next upkeep'
     }
     const res = await this.db.query(
       `update search_control
@@ -140,6 +152,29 @@ export class SearchUpkeep {
     )
     if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }
     return { ok, note }
+  }
+
+  /**
+   * Waits until every transaction open just after the generation was read
+   * has ended. The generation moves when old code writes, but its rows become
+   * visible only when it commits, so a run that read them sooner could count
+   * an old write as seen. After this wait, every write that moved the
+   * generation up to the value read is visible, and any later one moves it
+   * again, which voids the run. A transaction that stays open longer than
+   * settleMs (any transaction in the cluster that holds an id) fails the run,
+   * which retries at the next upkeep.
+   */
+  private async settle(): Promise<void> {
+    // A fresh transaction id is newer than every transaction holding one now
+    // (a snapshot's xmax is not: it can equal a running id).
+    const { mark } = (await this.db.query<{ mark: string }>('select pg_current_xact_id()::text as mark')).rows[0]
+    const until = Date.now() + this.settleMs
+    for (;;) {
+      const { done } = (await this.db.query<{ done: boolean }>('select pg_snapshot_xmin(pg_current_snapshot()) > $1::xid8 as done', [mark])).rows[0]
+      if (done) return
+      if (Date.now() >= until) throw new Error(`a transaction open when the generation was read did not end within ${this.settleMs} ms`)
+      await new Promise((r) => setTimeout(r, 100))
+    }
   }
 }
 

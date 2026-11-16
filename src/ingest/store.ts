@@ -1,4 +1,4 @@
-import type { Db } from '../db.js'
+import { checkout, type Db } from '../db.js'
 import { eventSidecarNsid } from '../contracts/contracts.js'
 
 export interface RecordRow {
@@ -81,7 +81,7 @@ export async function replaceAccountRecords(
   collections: string[],
   listed: { collection: string; rkey: string; cid: string; value: Record<string, unknown> }[],
 ): Promise<string[]> {
-  const client = await db.connect()
+  const client = await checkout(db)
   try {
     await client.query('begin')
     const seen = new Set<string>()

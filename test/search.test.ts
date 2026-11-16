@@ -578,8 +578,15 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     try {
       await a.query('begin')
       await a.query('update event_docs set closed_at = closed_at where false')
-      const migrating = migrate(db)
-      await new Promise((r) => setTimeout(r, 300))
+      let done = false
+      const migrating = migrate(db).finally(() => (done = true))
+      // Barrier: the migration is waiting on a lock (event_docs, held by a), or done.
+      for (let i = 0; !done; i++) {
+        const waiting = await db.query(`select 1 from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database() and pid <> $1`, [(a as unknown as { processID: number }).processID])
+        if (waiting.rowCount) break
+        if (i > 500) throw new Error('the migration neither finished nor waited on a lock')
+        await new Promise((r) => setTimeout(r, 10))
+      }
       await a.query('select active from accounts limit 1')
       await a.query('commit')
       await migrating
@@ -624,6 +631,8 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
         return {
           query: (text: string, values?: unknown[]) => (hung ? new Promise(() => {}) : db.query(text, values)),
           release: (err?: Error) => released.push(err),
+          on: () => {},
+          off: () => {},
         }
       },
     } as unknown as Db
@@ -632,6 +641,73 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     assert.ok(released[0] instanceof Error, 'the hung connection was released with an error, so the pool destroys it')
     await control.refresh()
     assert.equal(released[1], undefined)
+  })
+
+  it('counts for health behind the same write lock a first page waits for', async () => {
+    const holder = new pg.Client({ connectionString: dbUrl('routing_test') })
+    await holder.connect()
+    try {
+      await holder.query('begin')
+      await holder.query('select pg_advisory_xact_lock($1)', [7140015])
+      let counted = false
+      const counting = search.postgres.count().then(() => (counted = true))
+      await new Promise((r) => setTimeout(r, 300))
+      assert.equal(counted, false, 'counted while a projection held the write lock')
+      await holder.query('commit')
+      await counting
+    } finally {
+      await holder.query('rollback').catch(() => {})
+      await holder.end()
+    }
+  })
+
+  it('bounds a search_control call to 500 ms in all, waiting for a connection included', async () => {
+    const pool = {
+      connect: async () => {
+        await new Promise((r) => setTimeout(r, 300))
+        return {
+          query: async (text: string, values?: unknown[]) => {
+            await new Promise((r) => setTimeout(r, 300))
+            return db.query(text, values)
+          },
+          release: () => {},
+          on: () => {},
+          off: () => {},
+        }
+      },
+    } as unknown as Db
+    const started = Date.now()
+    await assert.rejects(new SearchControl(pool).refresh(), /did not answer/)
+    const took = Date.now() - started
+    assert.ok(took < 560, `took ${took} ms`)
+  })
+
+  it('survives a checked-out connection that the server ends, and does not pool it again', async () => {
+    const pool = controlPool(dbUrl('routing_test'), () => {})
+    try {
+      const control = new SearchControl(pool)
+      const real = pool.connect.bind(pool)
+      let pid: number | undefined
+      ;(pool as unknown as { connect: () => Promise<pg.PoolClient> }).connect = async () => {
+        const c = await real()
+        pid = (await c.query<{ p: number }>('select pg_backend_pid() as p')).rows[0].p
+        // The server ends this connection while it is checked out, before its query.
+        const query = c.query.bind(c) as (...a: unknown[]) => Promise<unknown>
+        ;(c as unknown as { query: unknown }).query = async (...a: unknown[]) => {
+          await db.query('select pg_terminate_backend($1)', [pid])
+          await new Promise((r) => setTimeout(r, 100))
+          return query(...a)
+        }
+        return c
+      }
+      await assert.rejects(control.refresh())
+      ;(pool as unknown as { connect: typeof real }).connect = real
+      await control.refresh()
+      const live = await db.query('select 1 from pg_stat_activity where pid = $1', [pid])
+      assert.equal(live.rowCount, 0)
+    } finally {
+      await pool.end()
+    }
   })
 
   it('looks at verification again before falling back to Postgres', async () => {
@@ -935,6 +1011,69 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     } finally {
       projector.elastic.allDocs = real
     }
+  })
+
+  it('counts a write by old code only once it is visible, even if it is still open when the run reads the generation', async () => {
+    const s1 = `at://${AUTHOR}/${SIDECAR}/3ks1`
+    const stored = (await db.query<{ value: unknown }>('select value from records where uri = $1', [s1])).rows[0].value
+    const upkeep = new SearchUpkeep(db, projector, () => {})
+    // Old code deletes the sidecar's record and moves the generation, but has not committed yet.
+    const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+    await old.connect()
+    await old.query('begin')
+    await old.query('update records set deleted = true, value = null where uri = $1', [s1])
+    let finished = false
+    const fill = upkeep.firstFill().finally(() => (finished = true))
+    try {
+      await new Promise((r) => setTimeout(r, 500))
+      assert.equal(finished, false, 'the fill finished while a write that moved the generation was still open')
+      await old.query('commit')
+    } finally {
+      await old.query('rollback').catch(() => {})
+      await old.end()
+    }
+    await fill
+    assert.equal((await readControl(db)).firstFillDone, true)
+    assert.equal(await projector.postgres.get(s1), undefined, 'the fill did not see the committed delete')
+
+    // A refill waits the same way for a write that then rolls back.
+    const rolling = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+    await rolling.connect()
+    await rolling.query('begin')
+    await rolling.query(`update index_state set updated_at = now() where uri = $1`, [s1])
+    assert.equal((await readControl(db)).firstFillDone, false)
+    finished = false
+    const refill = upkeep.firstFill().finally(() => (finished = true))
+    try {
+      await new Promise((r) => setTimeout(r, 500))
+      assert.equal(finished, false, 'the refill finished while a write that moved the generation was still open')
+      await rolling.query('rollback')
+    } finally {
+      await rolling.end()
+    }
+    await refill
+    assert.equal((await readControl(db)).firstFillDone, true)
+
+    // A transaction that stays open fails the fill, which records nothing.
+    await db.query('update search_control set first_fill_done = false')
+    const held = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+    await held.connect()
+    await held.query('begin')
+    await held.query('select pg_current_xact_id()')
+    upkeep.settleMs = 300
+    try {
+      await assert.rejects(upkeep.firstFill(), /did not end within 300 ms/)
+      assert.equal((await readControl(db)).firstFillDone, false)
+    } finally {
+      await held.query('rollback')
+      await held.end()
+    }
+
+    await db.query('update records set deleted = false, value = $2 where uri = $1', [s1, stored])
+    await projector.fillPostgres(s1)
+    await db.query('update search_control set pg_verified = false, compared_at = null')
+    await new SearchUpkeep(db, projector, () => {}).run()
+    assert.equal((await readControl(db)).pgVerified, true)
   })
 
   it('clears verification when a comparison finds a difference, whoever set it', async () => {

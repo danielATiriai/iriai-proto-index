@@ -178,9 +178,8 @@ begin
   return null;
 end
 $fn$;
--- Created only when missing: replacing a trigger locks its table, and an
--- older writer already inside the trigger (waiting on search_control) would
--- then deadlock with this script. Tables are taken in the order the
+-- Created only when missing: replacing a trigger locks its table
+-- exclusively, which an older writer mid-transaction would have to wait for. Tables are taken in the order the
 -- ingester writes them (records, accounts, index_state), as everywhere in
 -- this script.
 do $do$
@@ -206,8 +205,27 @@ export async function searchWriterSeen(db: Db): Promise<boolean> {
   return res.rows[0].v === '1'
 }
 
+/**
+ * Checks a client out of a pool for code that holds it across queries. A
+ * checked-out client has no pool listener, so a socket error would end the
+ * process: this one is heard, and a client that errored is destroyed on
+ * release rather than pooled again.
+ */
+export async function checkout(pool: pg.Pool): Promise<pg.PoolClient> {
+  const client = await pool.connect()
+  let failed: Error | undefined
+  const onError = (err: Error) => (failed = err)
+  client.on('error', onError)
+  const release = client.release.bind(client)
+  client.release = (err?: Error | boolean) => {
+    client.off('error', onError)
+    return release(err ?? failed)
+  }
+  return client
+}
+
 export async function migrate(db: Db): Promise<void> {
-  const client = await db.connect()
+  const client = await checkout(db)
   try {
     await client.query('select pg_advisory_lock(7140014)')
     await client.query(MIGRATION)

@@ -1,5 +1,5 @@
 import pg from 'pg'
-import type { Db } from '../db.js'
+import { checkout, type Db } from '../db.js'
 import type { BackendName } from './backend.js'
 
 export interface ControlRow {
@@ -127,23 +127,24 @@ export class SearchControl {
    * arrives after the wait gave up goes straight back.
    */
   private async bounded<R>(work: (q: Db) => Promise<R>): Promise<R> {
+    const deadline = Date.now() + CONTROL_MS
     const pool = this.db as Partial<pg.Pool>
-    if (typeof pool.connect !== 'function') return within(work(this.db))
+    if (typeof pool.connect !== 'function') return within(work(this.db), deadline)
     let gaveUp = false
-    const connecting: Promise<pg.PoolClient> = (this.db as pg.Pool).connect()
+    const connecting = checkout(this.db as pg.Pool)
     connecting.then(
-      (c: pg.PoolClient) => gaveUp && c.release(),
+      (c) => gaveUp && c.release(),
       () => {},
     )
     let client: pg.PoolClient
     try {
-      client = await within(connecting)
+      client = await within(connecting, deadline)
     } catch (err) {
       gaveUp = true
       throw err
     }
     try {
-      const out = await within(work(client as unknown as Db))
+      const out = await within(work(client as unknown as Db), deadline)
       client.release()
       return out
     } catch (err) {
@@ -153,14 +154,14 @@ export class SearchControl {
   }
 }
 
-/** The promise's result, or a rejection once CONTROL_MS has passed. */
-async function within<T>(work: Promise<T>): Promise<T> {
+/** The promise's result, or a rejection once the deadline (one for the whole call) has passed. */
+async function within<T>(work: Promise<T>, deadline: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined
   try {
     return await Promise.race([
       work,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`search_control did not answer within ${CONTROL_MS} ms`)), CONTROL_MS)
+        timer = setTimeout(() => reject(new Error(`search_control did not answer within ${CONTROL_MS} ms`)), Math.max(0, deadline - Date.now()))
       }),
     ])
   } finally {
