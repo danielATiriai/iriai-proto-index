@@ -1,0 +1,256 @@
+--- /home/user/iriai-proto-index/codex-reviews/es-off-until-scale-2026-11-16/spec.md	2026-11-16 05:24:18.949597656 +0000
++++ /mnt/project-files/eng/es-off-until-scale-2026-11-16/packet/spec.md	2026-11-16 05:36:10.735089822 +0000
+@@ -1,6 +1,6 @@
+ # Event search on Postgres until scale: technical specification
+ 
+-Draft v8, 2026-11-16 (v1 to v7 reviewed; v7 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
++Draft v9, 2026-11-16 (v1 to v7 reviewed; v7 and v8 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
+ 
+ ## 1. Goal and scope
+ 
+@@ -63,11 +63,11 @@
+ 
+ Indexes, each partial on current rows: unique `(uri)`, `(starts_at, uri)`, `(lat, lon)` where lat is not null, GiST `span(starts_at, ends_at)`, `(did)`, `(event_uri)`; under D1 A also the same lat/lon and span indexes on closed rows, and `(closed_at)`.
+ 
+-`span(s, e)`: null without a start; `[s, s]` without an end; `[s, e)` when e > s; null otherwise. `arc_m(...)`: haversine with radius 6,371,008.7714 m, the mean radius Elasticsearch uses.
++`span(s, e)`: null without a start; `[s, s]` without an end; `[s, e)` when e > s; null otherwise. `arc_m(...)`: haversine with radius 6,371,008.7714 m, the mean radius Elasticsearch uses; declared `STRICT`, so an unresolved point gives null and sorts last.
+ 
+ ### 4.2 Writes
+ 
+-Every `put` and every `remove` runs in one transaction that first takes `pg_advisory_xact_lock(7140015)` and only then takes a new number from `event_doc_version`. The order matters: a number taken before the lock could be lower than a snapshot read in between. While Elasticsearch is in use, the transaction also makes the Elasticsearch write (2 s timeout) before it commits, or raises `dirty_gen` when that write fails, so the lock covers both.
++Every `put` and every `remove` runs in one transaction that first takes `pg_advisory_xact_lock(7140015)` and only then takes a new number from `event_doc_version`. The order matters: a number taken before the lock could be lower than a snapshot read in between. The Elasticsearch write (5.1) follows the commit, outside the lock, with a 2 s timeout; a failure raises `dirty_gen`.
+ 
+ <!-- dp D1 -->
+ `put` closes the current row (`closed_version` = the new number, `closed_at = clock_timestamp()` read after the lock) and inserts the new row with `version` = the new number. `remove` closes the current row the same way and inserts nothing. Closed rows are deleted once `closed_at` is more than 61 minutes old (every 10 minutes, by the ingester): no paging session lasts longer than an hour.
+@@ -127,10 +127,10 @@
+ 
+ - Postgres may serve once it is verified: its first fill (5.4) is recorded and the ingester's own comparison (the verifying check of 6.4) has passed once. Verified is a latch: nothing clears it. Every write reaches Postgres first (5.1), so it cannot fall behind. The ingester runs the comparison after the first fill and hourly until it passes, and opens an issue on each failure; no sentence or command is needed.
+ - Elasticsearch may serve while `es_current` is set and no write to it has failed since the last repair (`dirty_gen` = `repaired_gen`). It is in use while `SEARCH_ES=on` on the ingester (default `on`) or, after PR 2, the controller is in `starting` to `draining`. While in use, the ingester writes to it (5.1), sends a cluster-health request every 2 minutes (recording `es_seen_at`), and every 10 minutes repairs it if dirty (reconcile, 6.4). When use begins and `es_current` is clear, the ingester builds a fresh index and then sets `es_current`; when use ends, it clears `es_current` and sends nothing more. Use cannot end before Postgres is verified: until then the ingester ignores `SEARCH_ES=off`, opens an issue and says so in health.
+-- The may-serve check for Elasticsearch is made at each first page, under the shared lock of 4.3 as the snapshot opens, not from the 30-second copy of the control row; with the write lock of 4.2 this means no new session opens on an Elasticsearch that has missed a committed write.
++- The may-serve check for Elasticsearch reads the control row fresh at each first page (one single-row read), not the 30-second copy. A write that Elasticsearch has not yet taken or has just failed can still be missed by a session opened within the next 2 seconds, the write's timeout; Elasticsearch's own 1-second refresh already gives the same kind of delay today.
+ - A new session goes to the chosen backend (the state, or `SEARCH_BACKEND_FORCE`) if it may serve, else to Postgres if verified, else answers `ServiceUnavailable`. A first page Elasticsearch fails within 2 seconds is answered from Postgres if verified. Health reports which backend served and why.
+ 
+-So after verification, Postgres always serves when Elasticsearch cannot; before it, Elasticsearch is the only backend, as today. Later comparisons (verifying, 6.4) only decide whether the controller switches to Elasticsearch; they never change what may serve. Cost of the rule: a switch to Elasticsearch waits for a full fill; a dirty Elasticsearch hands new sessions to Postgres until a repair succeeds (every 10 minutes while it answers, so through any outage); while Elasticsearch is in use, each write waits for it, up to 2 s; until the first comparison passes, Elasticsearch stays on at today's cost, its failures answer `ServiceUnavailable` and its outages stall ingestion, as today.
++So after verification, Postgres always serves when Elasticsearch cannot; before it, Elasticsearch is the only backend, as today. Later comparisons (verifying, 6.4) only decide whether the controller switches to Elasticsearch; they never change what may serve. Cost of the rule: a switch to Elasticsearch waits for a full fill; a dirty Elasticsearch hands new sessions to Postgres until a repair succeeds (every 10 minutes while it answers, so through any outage); a new Elasticsearch session can miss a write made in the last 2 seconds; until the first comparison passes, Elasticsearch stays on at today's cost, its failures answer `ServiceUnavailable` and its outages stall ingestion, as today.
+ 
+ ### 5.3 Health
+ 
+@@ -138,7 +138,7 @@
+ 
+ ### 5.4 First fill and rebuild
+ 
+-On first start after deploy, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done. Today's index is not trusted, because its version numbers are Elasticsearch's own: the ingester then builds a fresh index from Postgres with external versions (backfill and reconcile, 6.4), sets `es_current` and deletes the old index. Until both are done, `queryEvents` and `getEvent` answer `ServiceUnavailable` with Retry-After, a few seconds at today's size. Whenever a fresh index becomes current, the previous one is deleted, so the volume holds at most two.
++On first start after deploy, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done. Today's index is not trusted, because its version numbers are Elasticsearch's own: the ingester then builds a fresh index from Postgres with external versions (backfill and reconcile, 6.4), sets `es_current` and treats the old index as the previous one (below). Until both are done, `queryEvents` and `getEvent` answer `ServiceUnavailable` with Retry-After, a few seconds at today's size. Whenever a fresh index becomes current, the previous one is kept until `elastic_cursors_until` (61 minutes) so open paging sessions finish, then deleted. At every tick the ingester deletes any index that is neither current nor that previous one, which removes candidates left by a failed build.
+ 
+ ## 6. The scale controller
+ 
+@@ -157,7 +157,7 @@
+ ### 6.2 Thresholds
+ 
+ <!-- dp D2 -->
+-On when either holds: on 3 consecutive UTC days, with at least 500 queryEvents calls each, the Postgres p95 is at least 250 ms or more than 1% of searches hit the 2 s limit; or on any day the current events number 500,000 or more. Back when Elasticsearch has served at least 30 days and, on 14 consecutive days, the Postgres shadow p95 is at most 100 ms and the events number 250,000 or fewer. All six numbers are settings.
++On when either holds: on 3 consecutive UTC days, with at least 500 queryEvents calls each, the Postgres p95 is at least 250 ms or more than 1% of searches hit the 2 s limit; or on any day the current events number 500,000 or more. Back when Elasticsearch has served at least 30 days and, on 14 consecutive days, the Postgres shadow p95 is at most 100 ms and the events number 250,000 or fewer; a day with fewer than 500 calls counts as fast, so a quiet Elasticsearch is turned off. All six numbers are settings.
+ <!-- opt B -->
+ On when the current events number 500,000 or more on any day. Timeouts are recorded but do not count. Back when Elasticsearch has served at least 30 days and the events have numbered 250,000 or fewer on 14 consecutive days. Both numbers are settings.
+ <!-- /dp -->
+@@ -178,9 +178,9 @@
+ 
+ - ready → starting: the controller opens a GitHub issue in danielATiriai/iriai-proto-index (GitHub emails Daniel) and turns Elasticsearch on (6.3).
+ - starting: waits for cluster health yellow or green, up to 30 minutes.
+-- backfilling: creates a fresh index `placeproto-events-<yyyymmdd>` with today's mapping and `index.gc_deletes` 2 hours; copies every current row, 500 per bulk request, with external versions; then reconciles.
++- backfilling: creates a fresh index `placeproto-events-<n>`, where n is a counter in `search_control` raised for every build, with today's mapping and `index.gc_deletes` 2 hours; copies every current row, 500 per bulk request, with external versions; then reconciles.
+ - Reconcile: notes `dirty_gen` at its start, reads every document id and version from Elasticsearch and compares with the current rows: re-puts missing or older documents; for a document with no current row, takes a fresh number and re-checks Postgres under the write lock, then, after commit and only if there was still no current row, deletes in Elasticsearch with that number. At its end it sets `repaired_gen` to the generation it noted, so a write that failed during the pass leaves `dirty_gen` above `repaired_gen` and is repaired next tick. Runs at the end of every fill, every 10 minutes while dirty, and once a day while in use (5.2).
+-- verifying: after a refresh, the id-and-version sets must be equal; then for each stored query shape (or 50 built-in shapes when fewer are stored) positions 1 to 45 of a 51-result first page from both backends must hold the same events, in the same order apart from results whose distances differ by under 5 cm, ignoring events within 5 cm of a radius edge. A difference involving an event that changed during the check is retried, up to 3 times. Any other difference is a failure.
++- verifying: after a refresh, the id-and-version sets must be equal; then for each stored query shape (or 50 built-in shapes when fewer are stored) each event in positions 1 to 45 of one backend's 51-result first page must appear in the other's 51, and those shared events must be in the same order apart from results whose distances differ by under 5 cm; events within 5 cm of a radius edge are ignored. A difference involving an event that changed during the check is retried, up to 3 times. Any other difference is a failure.
+ - on: new sessions use Elasticsearch, within the rule of 5.2. A later page of an Elasticsearch session that fails answers `ServiceUnavailable`, as today. If more than 20 first pages fall back within 10 minutes while `es_seen_at` is under 5 minutes old, or the cluster is red or no keep-awake has been answered for 30 minutes since the ingester started (compared in SQL), the controller moves to draining and opens an issue.
+ - draining: new sessions use Postgres; `elastic_cursors_until` = now + 61 minutes; after that, use ends (5.2) and Elasticsearch is turned off (6.3).
+ - Failure: any failure in starting, backfilling or verifying turns Elasticsearch off again (6.3), returns to `off`, counts a failure and opens an issue.
+@@ -213,8 +213,8 @@
+ - Today: Elasticsearch about $13 a month (1.28 GB held around the clock, near-zero CPU, 0.25 GB volume).
+ - Below the trigger, today and at ten times today's events: Elasticsearch $0.04 a month (volume only); Postgres adds $0.10 to $0.50 a month.
+ - At the trigger (about 500,000 events): Postgres about 0.7 GB of table and up to 1 GB of memory, $5 to $10 a month; Elasticsearch, while on, $13 to $20 a month.
+-- Stop point: Elasticsearch's service limits of 2 GB memory and 1 vCPU (Daniel's sentence) cap its compute at about $40 a month; realistic $13 to $20. Its disk is billed on top: at most two indexes (5.4), about 1 to 2 GB at 500,000 events, under $0.50 a month [price unverified]. At the memory limit Railway restarts it; first pages fall back to Postgres, later pages of its sessions get `ServiceUnavailable`, and repeated fallbacks drain it (6.4).
+-- Postgres has no stop point. Exposure estimate: about $10 a month at 500,000 events (1 GB memory at $10), which nothing enforces: the workspace alert at $55 only warns. For Daniel to accept by name.
++- Stop point: Elasticsearch's service limits of 2 GB memory and 1 vCPU (Daniel's sentence) cap its compute at about $40 a month; realistic $13 to $20. Its disk is billed on top and has no stop point: one current index, plus the previous one for 61 minutes after a switch (5.4), about 0.7 GB per 500,000 events, so about $0.10 a month at 500,000 and $0.20 at a million [price unverified]. At the memory limit Railway restarts it; first pages fall back to Postgres, later pages of its sessions get `ServiceUnavailable`, and repeated fallbacks drain it (6.4).
++- Postgres, and Elasticsearch's disk, have no stop point. Exposure estimate: about $11 a month at 500,000 events (Postgres 1 GB memory at $10, disk under $1), which nothing enforces: the workspace alert at $55 only warns. For Daniel to accept by name: "Index search: no stop point on Postgres or Elasticsearch's disk, exposure estimate $11 a month accepted".
+ - GitHub: the issues API on the free plan bills nothing.
+ 
+ ## 9. Secrets and settings
+--- /home/user/iriai-proto-index/codex-reviews/es-off-until-scale-2026-11-16/packet.src.html	2026-11-16 05:24:18.951911136 +0000
++++ /mnt/project-files/eng/es-off-until-scale-2026-11-16/packet/packet.src.html	2026-11-16 05:37:49.238708149 +0000
+@@ -255,7 +255,7 @@
+ 
+ <!-- ===================== 0 HEADER ===================== -->
+ <section class="part" id="p0">
+-  <p class="kicker">Proposal v8 · build <span class="mono" data-build="">{{BUILD}}</span> · <span class="badge soft">awaiting your answer</span></p>
++  <p class="kicker">Proposal v9 · build <span class="mono" data-build="">{{BUILD}}</span> · <span class="badge soft">awaiting your answer</span></p>
+   <h1>Event search without Elasticsearch until scale</h1>
+   <p class="lede" data-dp="D1">query.iriai.app searches from the Postgres database we already run. Elasticsearch, about $13 of the placeproto project's $16 a month, is turned off and comes back when the trigger you pick in D2 and D3 says Postgres is no longer enough.
+     <template data-opt="B">query.iriai.app searches from the Postgres database we already run, with pages that follow live data. Elasticsearch, about $13 of the placeproto project's $16 a month, is turned off and comes back when the trigger you pick in D2 and D3 says Postgres is no longer enough.</template></p>
+@@ -264,11 +264,11 @@
+       <dt>Feature</dt><dd>Search on Postgres with a scale trigger for Elasticsearch. Product: PlaceProto index (iriai-proto-index), query.iriai.app. No workbook row yet.</dd>
+       <dt>Thread</dt><dd>"Move event search off Elasticsearch until scale", Iriai Eng.</dd>
+       <dt>Your ask</dt><dd>"Yes - let's see a proposal for triggering elastic search automatically when we reach a certain amount of scale but keep it turned off until then" (cost thread, Nov 16, 02:40 UTC).</dd>
+-      <dt>Spec</dt><dd><a href="files/spec.html">spec.html</a> (source <a href="files/spec.md">spec.md</a>), draft v8 of Nov 16, with the same decision points as this page. The Drive copy follows approval.</dd>
++      <dt>Spec</dt><dd><a href="files/spec.html">spec.html</a> (source <a href="files/spec.md">spec.md</a>), draft v9 of Nov 16, with the same decision points as this page. The Drive copy follows approval.</dd>
+       <dt>Spike</dt><dd>Postgres timings at 10,000, 100,000 and 1,000,000 events: <a href="files/spec.html#s4-5">spec 4.5</a>; scripts in the proposal folder, <span class="mono">eng/es-off-until-scale-2026-11-16/spike/</span>.</dd>
+       <dt>Decide by</dt><dd>Nov 20. Unanswered, nothing is built and Elasticsearch keeps running as today.</dd>
+       <dt>Build hash</dt><dd><span class="mono">{{BUILD}}</span>: the first seven characters of the sha256 of this page.</dd>
+-      <dt>Packet files</dt><dd><a href="files/packet.src.html">source</a>, <a href="files/MODEL.json">decisions and relations</a>, renders at <a href="files/packet-1440.png">1440</a> and <a href="files/packet-390.png">390</a> wide, <a href="files/BUILD.txt">BUILD.txt</a>, <a href="files/CHECKS.txt">CHECKS.txt</a>, reviews of <a href="files/REVIEW-v1.md">round 1</a> and <a href="files/REVIEW-v2.md">2</a> and <a href="files/REVIEW-v3.md">3</a>, <a href="files/REVIEW-v4.md">4</a>, <a href="files/REVIEW-v5.md">5</a>, <a href="files/REVIEW-v6.md">6</a>, <a href="files/REVIEW-v7.md">7</a> and Codex's <a href="files/CODEX-REVIEW-v7.md">review of v7</a> with their triages (<a href="files/CODEX-TRIAGE-v1.md">1</a>, <a href="files/CODEX-TRIAGE-v2.md">2</a>, <a href="files/CODEX-TRIAGE-v3.md">3</a>, <a href="files/CODEX-TRIAGE-v4.md">4</a>, <a href="files/CODEX-TRIAGE-v5.md">5</a>, <a href="files/CODEX-TRIAGE-v6.md">6</a>, <a href="files/CODEX-TRIAGE-v7.md">7</a>, <a href="files/CODEX-TRIAGE-v8.md">8</a>).</dd>
++      <dt>Packet files</dt><dd><a href="files/packet.src.html">source</a>, <a href="files/MODEL.json">decisions and relations</a>, renders at <a href="files/packet-1440.png">1440</a> and <a href="files/packet-390.png">390</a> wide, <a href="files/BUILD.txt">BUILD.txt</a>, <a href="files/CHECKS.txt">CHECKS.txt</a>, reviews of <a href="files/REVIEW-v1.md">round 1</a> and <a href="files/REVIEW-v2.md">2</a> and <a href="files/REVIEW-v3.md">3</a>, <a href="files/REVIEW-v4.md">4</a>, <a href="files/REVIEW-v5.md">5</a>, <a href="files/REVIEW-v6.md">6</a>, <a href="files/REVIEW-v7.md">7</a> and Codex's reviews of <a href="files/CODEX-REVIEW-v7.md">v7</a> and <a href="files/CODEX-REVIEW-v8.md">v8</a> with their triages (<a href="files/CODEX-TRIAGE-v1.md">1</a>, <a href="files/CODEX-TRIAGE-v2.md">2</a>, <a href="files/CODEX-TRIAGE-v3.md">3</a>, <a href="files/CODEX-TRIAGE-v4.md">4</a>, <a href="files/CODEX-TRIAGE-v5.md">5</a>, <a href="files/CODEX-TRIAGE-v6.md">6</a>, <a href="files/CODEX-TRIAGE-v7.md">7</a>, <a href="files/CODEX-TRIAGE-v8.md">8</a>, <a href="files/CODEX-TRIAGE-v9.md">9</a>).</dd>
+       <dt>Default reading</dt><dd>{{WORDS}} words with every fold closed.</dd>
+     </dl>
+     <ol class="toc" start="0">
+@@ -296,14 +296,14 @@
+   <noscript><p class="im-fallback show">Option text could not be shown on this page. You are reading the recommended version, and each option still lists its rows. To choose another option, answer in the thread.</p></noscript>
+   <p class="im-fallback" id="im-fallback">Option text could not be shown on this page. You are reading the recommended version, and each option still lists its rows. To choose another option, answer in the thread.</p>
+ 
+-  <p class="small" data-dp="D3">All three are Proposed; none is a one-way door. <b>Approval starts</b> two PRs in iriai-proto-index, each through PR review. Each Railway setting change waits for your sentence (part 8); what happens when the trigger fires is D3.
+-    <template data-opt="B">All three are Proposed; none is a one-way door. <b>Approval starts</b> two PRs in iriai-proto-index, each through PR review. Setup changes wait for your sentence (part 8); after that, this approval lets the ingester deploy and remove Elasticsearch with no further word.</template>
+-    <template data-opt="C">All three are Proposed; none is a one-way door. <b>Approval starts</b> two PRs in iriai-proto-index, each through PR review. <b>It does not start</b> any Railway change: each one waits for your sentence (part 8).</template></p>
++  <p class="small" data-dp="D3">All three are Proposed; none is a one-way door. <b>Approval starts</b> two PRs in iriai-proto-index, each through PR review; each merges only on your separate merge word, with its risk rated (production infrastructure, so at least medium). Each Railway setting change waits for your sentence (part 8); what happens when the trigger fires is D3.
++    <template data-opt="B">All three are Proposed; none is a one-way door. <b>Approval starts</b> two PRs in iriai-proto-index, each through PR review; each merges only on your separate merge word, with its risk rated (production infrastructure, so at least medium). Setup changes wait for your sentence (part 8); after that, this approval lets the ingester deploy and remove Elasticsearch with no further word.</template>
++    <template data-opt="C">All three are Proposed; none is a one-way door. <b>Approval starts</b> two PRs in iriai-proto-index, each through PR review; each merges only on your separate merge word, with its risk rated (production infrastructure, so at least medium). <b>It does not start</b> any Railway change: each one waits for your sentence (part 8).</template></p>
+ 
+   <h3>How to answer</h3>
+   <ul>
+     <li><b>Here:</b> make your choices, tap <b>Record</b>, send <code>recorded &lt;id&gt;</code> in the thread, then confirm the card that quotes your whole record.</li>
+-    <li><b>In words:</b> reply <code>Approve proposal "Search without Elasticsearch" v8 as recommended</code>, or add <code>except D3: C</code> or <code>hold D2</code>.</li>
++    <li><b>In words:</b> reply <code>Approve proposal "Search without Elasticsearch" v9 as recommended</code>, or add <code>except D3: C</code> or <code>hold D2</code>.</li>
+     <li>Text shown for an option other than the recommendation is a <b>preview</b>. If you pick one, the thread sends you the page as your selection to confirm, and it is reviewed before any work starts.</li>
+     <li>Comments and page feedback are feedback, not approval. Silence approves nothing.</li>
+   </ul>
+@@ -312,11 +312,10 @@
+   <script type="application/json" id="packet-relations">
+   {
+     "mootWhen": [ { "dec": "D2", "when": ["D1 hold"], "why": "With paging held, search stays on Elasticsearch and no trigger is built, so there is nothing to measure." },
+-                  { "dec": "D3", "when": ["D1 hold"], "why": "With paging held, search stays on Elasticsearch and no trigger is built, so there is nothing to turn on." },
+-                  { "dec": "D3", "when": ["D2 hold"], "why": "With the trigger's measure held, nothing ever switches, so how Elasticsearch turns on has nothing to decide." } ]
++                  { "dec": "D3", "when": ["D1 hold"], "why": "With paging held, search stays on Elasticsearch and no trigger is built, so there is nothing to turn on." } ]
+   }
+   </script>
+-  <form id="decisions-form" onsubmit="return false" data-proposal="search-without-elasticsearch" data-version="v8" data-spec="spec">
++  <form id="decisions-form" onsubmit="return false" data-proposal="search-without-elasticsearch" data-version="v9" data-spec="spec">
+   <details class="dec" data-dec="D1"><summary><span class="id">D1</span>How paging behaves on Postgres<span class="rs">recommended A</span><span class="mark" id="D1s"></span></summary><div class="body">
+     <p class="q">When an app pages through results, does it see one frozen moment, as today? <span class="door">reversible</span></p>
+     <ul class="opts">
+@@ -327,6 +326,7 @@
+         <dl class="rows"><dt>You</dt><dd>The public promise changes: README and PlaceProto §5 say pages follow live data.</dd><dt>Built</dt><dd>One row per event, no versions, no clean-up.</dd><dt>Risk</dt><dd>An app paging slowly through a busy area can miss an edited event.</dd><dt>Later</dt><dd>Going back to A adds versions; no data is lost.</dd></dl>
+         <details class="chg"><summary>What B changes against A</summary><ul>
+           <li data-k="changes" data-part="p0">The summary says pages follow live data.</li>
++          <li data-k="changes" data-part="p2">Apps may notice an edited event missed or repeated between pages.</li>
+           <li data-k="changes" data-part="p3">Step 3: later pages read live data.</li>
+           <li data-k="changes" data-part="p4">Paging works without snapshots.</li>
+           <li data-k="changes" data-part="p6">The recommended row lists the paging change as breaking.</li>
+@@ -350,7 +350,7 @@
+   <details class="dec" data-dec="D2"><summary><span class="id">D2</span>What triggers the switch<span class="rs">recommended A</span><span class="mark" id="D2s"></span></summary><div class="body">
+     <p class="q">What counts as "enough scale"? <span class="door">reversible: settings</span></p>
+     <ul class="opts">
+-      <li class="isrec"><input type="radio" name="D2" id="D2A" value="A" checked data-label="Speed or size: slow searches on 3 days, or 500,000 events"><div class="opt"><label for="D2A"><span class="ol">A. Speed or size</span><span class="od">On when, on 3 days running with at least 500 searches a day, the slowest 5% take 250 ms or more or over 1% time out; or at 500,000 events. Back after at least 30 days on, once for 14 days the slowest 5% take 100 ms or less and events number 250,000 or fewer. At most one switch-on in 30 days.</span></label>
++      <li class="isrec"><input type="radio" name="D2" id="D2A" value="A" checked data-label="Speed or size: slow searches on 3 days, or 500,000 events"><div class="opt"><label for="D2A"><span class="ol">A. Speed or size</span><span class="od">On when, on 3 days running with at least 500 searches a day, the slowest 5% take 250 ms or more or over 1% time out; or at 500,000 events. Back after at least 30 days on, once for 14 days the slowest 5% take 100 ms or less (a day with under 500 searches counts) and events number 250,000 or fewer. At most one switch-on in 30 days.</span></label>
+         <dl class="rows"><dt>You</dt><dd>Elasticsearch comes back when users would feel it.</dd><dt>Built</dt><dd>Daily timing stats; while Elasticsearch serves, 1 in 10 searches also timed on Postgres.</dd><dt>Risk</dt><dd>A slow spell on Railway could count, and then Elasticsearch stays on, and bills, for at least 30 days. A failed switch-on waits 30 days for the next try.</dd><dt>Later</dt><dd>All six numbers are settings.</dd></dl>
+       </div></li>
+       <li><input type="radio" name="D2" id="D2B" value="B" data-label="Size only: 500,000 events on, 250,000 off"><div class="opt"><label for="D2B"><span class="ol">B. Size only</span><span class="od">On at 500,000 events; back after at least 30 days on, once events number 250,000 or fewer for 14 days. At most one switch-on in 30 days. Speed does not count.</span></label>
+@@ -360,7 +360,7 @@
+           <li data-k="removes" data-part="p4">No shadow timing on Postgres.</li>
+         </ul></details>
+       </div></li>
+-      <li class="hold"><input type="radio" name="D2" id="D2H" value="hold" data-label="Hold D2"><div class="opt"><label for="D2H"><span class="ol">Hold</span><span class="od">Not decided now. Search moves to Postgres and both numbers are recorded, but no controller is built and nothing switches. D3 has nothing to decide until then.</span></label>
++      <li class="hold"><input type="radio" name="D2" id="D2H" value="hold" data-label="Hold D2"><div class="opt"><label for="D2H"><span class="ol">Hold</span><span class="od">Not decided now. Search moves to Postgres and both numbers are recorded, but no controller is built and nothing switches automatically. D3 still decides how Elasticsearch is turned off at rollout.</span></label>
+         <dl class="rows"><dt>You</dt><dd>Pick a measure later, with real numbers in hand.</dd><dt>Built</dt><dd>Postgres search and the daily stats; no controller.</dd><dt>Risk</dt><dd>At scale, search stays on Postgres until you decide.</dd><dt>Later</dt><dd>Nothing to undo.</dd></dl>
+       </div></li>
+     </ul>
+@@ -396,7 +396,7 @@
+           <li data-k="changes" data-part="p9">The risk becomes a slow answer.</li>
+         </ul></details>
+       </div></li>
+-      <li class="hold"><input type="radio" name="D3" id="D3H" value="hold" data-label="Hold D3"><div class="opt"><label for="D3H"><span class="ol">Hold</span><span class="od">Not decided now. The controller is built and measures, but when the trigger is met it only opens an issue.</span></label>
++      <li class="hold"><input type="radio" name="D3" id="D3H" value="hold" data-label="Hold D3"><div class="opt"><label for="D3H"><span class="ol">Hold</span><span class="od">Not decided now. At rollout Elasticsearch is turned off by removing its deployment, on your sentence; the controller is built and measures, but when the trigger is met it only opens an issue.</span></label>
+         <dl class="rows"><dt>You</dt><dd>Decide when, or if, the trigger is met.</dd><dt>Built</dt><dd>Everything but turning Elasticsearch on and off.</dd><dt>Risk</dt><dd>At scale, search stays on Postgres until you decide.</dd><dt>Later</dt><dd>Nothing to undo.</dd></dl>
+       </div></li>
+     </ul>
+@@ -437,7 +437,8 @@
+   <h2><span class="n">2</span>The problem and the goal</h2>
+   <p>Elasticsearch holds 1.28 GB of memory around the clock at almost no CPU: about $13 a month at Railway's $10 per GB. It searches 9 events and does nothing Postgres cannot: no text search, only a map radius or box, a time window, author and event filters, two sort orders and paging. <span class="tag">record</span> Railway metrics, 7 days; code at d9ab983; the $16 project total from the cost thread, Nov 16.</p>
+   <p><b>Goal:</b> the same answers from query.iriai.app for about $13 a month less, with a measured trigger for bringing Elasticsearch back.</p>
+-  <p class="small muted">For Iriai (the bill) and every app calling query.iriai.app (they should notice nothing). We will know it worked when Railway's usage page shows Elasticsearch near $0, the acceptance check passes on Postgres, and the slowest 5% of searches stay under 250 ms.</p>
++  <p class="small muted" data-dp="D1">For Iriai (the bill) and every app calling query.iriai.app (they should notice nothing). We will know it worked when Railway's usage page shows Elasticsearch near $0, the acceptance check passes on Postgres, and the slowest 5% of searches stay under 250 ms.
++    <template data-opt="B">For Iriai (the bill) and every app calling query.iriai.app (they should notice nothing, except that an event edited between pages can be missed or shown twice). We will know it worked when Railway's usage page shows Elasticsearch near $0, the acceptance check passes on Postgres, and the slowest 5% of searches stay under 250 ms.</template></p>
+ </section>
+ 
+ <!-- ===================== 3 EXPERIENCE ===================== -->
+@@ -477,7 +478,7 @@
+ <section class="part" id="p4">
+   <h2><span class="n">4</span>How it works</h2>
+   <p><b>One interface, two backends.</b> The query service and the ingester talk to "a search backend" with seven calls. Postgres and Elasticsearch each implement them. <span class="tag planned">planned</span> <a href="files/spec.html#s3">Spec 3</a>.</p>
+-  <p><b>Postgres is always written and always complete.</b> Every event lands in a new table, <code>event_docs</code>, whatever is serving, and single-event lookups always read it. Elasticsearch is written only while it is on, and a failed Elasticsearch write no longer holds up ingestion: a repair pass fixes it. <span class="tag planned">planned</span> <a href="files/spec.html#s5">Spec 5</a>.</p>
++  <p><b>Postgres is always written and always complete.</b> Every event lands in a new table, <code>event_docs</code>, whatever is serving; single-event lookups follow the same rule as searches. Elasticsearch is written only while it is on. Once Postgres has passed its first check, a failed Elasticsearch write no longer holds up ingestion: a repair pass fixes it. Before that, it is replayed, as today. <span class="tag planned">planned</span> <a href="files/spec.html#s5">Spec 5</a>.</p>
+   <p><b>Elasticsearch becomes optional.</b> Today both services refuse to start until Elasticsearch answers. PR 1 removes that wait, so turning Elasticsearch off cannot take the API down. <span class="tag code">code</span> src/main.ts; <a href="files/spec.html#s5-2">spec 5.2</a>.</p>
+   <details><summary>More: same answers, paging, speed, the trigger, the controller</summary>
+   <p><b>Same answers.</b> Filters, sort orders and tie-breaks are copied rule by rule, and every existing search test runs on both. Distances differ by a few millimetres, because Elasticsearch rounds stored points to about 1 cm: two results within about 5 cm of each other's distance can swap, and an event within 5 cm of a radius edge can fall either side. <span class="tag planned">planned</span> <a href="files/spec.html#s4-4">Spec 4.4</a>.</p>
+@@ -489,7 +490,7 @@
+   <p data-dp="D3"><b>On and off.</b> Railway's Serverless setting puts Elasticsearch to sleep 5 to 10 minutes after it last sent anything, and a request wakes it. "On" means the controller calls it until it answers, then checks it every 2 minutes so it stays awake; "off" means our services send it nothing. Our code holds no Railway credential, so a weekly check this thread sets up reads its memory on Railway to confirm it sleeps. D3. <span class="tag">docs</span> Railway Serverless; waking over the private network is checked in gate 2. <a href="files/spec.html#s6-3">Spec 6.3</a>.
+     <template data-opt="B"><b>On and off.</b> The ingester holds a Railway project token and deploys or removes the Elasticsearch service through Railway's API. Our code calls only that service, but the token can read and change everything in placeproto, Postgres's password included. D3. <a href="files/spec.html#s6-3">Spec 6.3</a>.</template>
+     <template data-opt="C"><b>On and off.</b> The controller opens a GitHub issue and waits; your sentence has a thread deploy or remove the Elasticsearch service, and the controller carries on when it sees the result. Our code holds no Railway credential. D3. <a href="files/spec.html#s6-3">Spec 6.3</a>.</template></p>
+-  <p><b>One rule:</b> Postgres serves once the ingester has filled it and seen it give the same answers as Elasticsearch, and from then on it always may: every write reaches it first. Elasticsearch serves only while freshly filled from Postgres with no write waiting for repair, checked at each first page; while it is in use, each write waits for it, up to 2 seconds. A search goes to the chosen backend if it may serve, else to Postgres. Until that first check passes, Elasticsearch stays on and serves alone, as today. <a href="files/spec.html#s5-2">Spec 5.2</a>.</p>
++  <p><b>One rule:</b> Postgres serves once the ingester has filled it and seen it give the same answers as Elasticsearch, and from then on it always may: every write reaches it first. Elasticsearch serves only while freshly filled from Postgres with no write waiting for repair, checked at each first page; a new session can miss a write from the last 2 seconds, as Elasticsearch's own refresh already allows today. A search goes to the chosen backend if it may serve, else to Postgres. Until that first check passes, Elasticsearch stays on and serves alone, as today. <a href="files/spec.html#s5-2">Spec 5.2</a>.</p>
+   <p><b>The controller</b> runs in the ingester every 10 minutes and walks the states in 4d. Before moving searches it checks that both backends hold the same events at the same versions and give the same first page for every stored query shape. A repair pass compares the two every day while Elasticsearch serves. <span class="tag planned">planned</span> <a href="files/spec.html#s6-4">Spec 6.4</a>.</p>
+   </details>
+ 
+@@ -702,7 +703,7 @@
+ <!-- ===================== 8 IMPLICATIONS ===================== -->
+ <section class="part" id="p8">
+   <h2><span class="n">8</span>Implications</h2>
+-  <p><b>Running cost:</b> Elasticsearch from about $13 to about $0.04 a month, compute capped at about $40 while on; Postgres has no stop point (about $10 a month at the trigger). <b>You type</b> the setup sentences in the last row, and accept the Postgres estimate by name: "Index search on Postgres: no stop point, exposure estimate $10 a month accepted".</p>
++  <p><b>Running cost:</b> Elasticsearch from about $13 to about $0.04 a month, compute capped at about $40 while on; Postgres and Elasticsearch's disk have no stop point (about $11 a month at the trigger). <b>You type</b> the setup sentences in the last row, and accept that estimate by name: "Index search: no stop point on Postgres or Elasticsearch's disk, exposure estimate $11 a month accepted".</p>
+   <details><summary>All implications: data, security, rollout, cost, earlier decisions, sentences</summary>
+   <div class="tbl"><table>
+     <thead><tr><th>Concern</th><th>Answer</th><th>Spec</th></tr></thead>
+@@ -714,7 +715,7 @@
+         <template data-opt="C"><td>Security</td><td>New: a GitHub token in the ingester limited to issues in iriai-proto-index, stored with the secrets helper; it can open, edit and close issues there, and our code only opens and comments. No Railway credential. <span class="tag planned">planned</span></td><td>9</td></template></tr>
+       <tr><td>Rollout and rollback</td><td>Postgres is filled and compared on production while Elasticsearch still serves; then reads switch by one setting. Rollback: two settings; reads move back only once Elasticsearch is rebuilt and answering, minutes at today's size. <span class="tag planned">planned</span></td><td>7</td></tr>
+       <tr><td>How we know it works</td><td>The acceptance check; <code>/xrpc/_health</code> shows backend, timings and state; every controller step opens a GitHub issue. <span class="tag planned">planned</span></td><td>5.3, 6</td></tr>
+-      <tr><td>Running cost (Railway)</td><td><b>Plan:</b> Pro, $20 a month including $20 of usage. <b>Expected:</b> Elasticsearch from about $13 to about $0.04 a month (disk only), today and at ten times today's events; Postgres adds $0.10 to $0.50. At the trigger (about 500,000 events): Postgres $5 to $10, Elasticsearch $13 to $20 while on. <b>Alert:</b> the workspace email alert at $55, covering compute of the whole workspace; Railway does not say how late it reports. If the ingester's first check never passes, Elasticsearch stays on at today's $13 and you get an issue. <b>Stop point:</b> Elasticsearch's limits set to 2 GB of memory and 1 vCPU cap its compute at about $40 a month; its disk is billed on top, at most two indexes, under $0.50 a month. At the limit Railway restarts it: first pages fall back to Postgres, later pages of its sessions fail as today, and repeated failures move search back. <b>Postgres has no stop point:</b> exposure estimate about $10 a month at 500,000 events, which nothing enforces (the alert only warns); to accept it, write "Index search on Postgres: no stop point, exposure estimate $10 a month accepted". <span class="tag">docs</span> memory and vCPU prices; disk price <span class="tag">unverified</span>.</td><td>8</td></tr>
++      <tr><td>Running cost (Railway)</td><td><b>Plan:</b> Pro, $20 a month including $20 of usage. <b>Expected:</b> Elasticsearch from about $13 to about $0.04 a month (disk only), today and at ten times today's events; Postgres adds $0.10 to $0.50. At the trigger (about 500,000 events): Postgres $5 to $10, Elasticsearch $13 to $20 while on. <b>Alert:</b> the workspace email alert at $55, covering compute of the whole workspace; Railway does not say how late it reports. If the ingester's first check never passes, Elasticsearch stays on at today's $13 and you get an issue. <b>Stop point:</b> Elasticsearch's limits set to 2 GB of memory and 1 vCPU cap its compute at about $40 a month; its disk is billed on top with no stop point, about $0.10 to $0.20 a month at 500,000 to a million events. At the limit Railway restarts it: first pages fall back to Postgres, later pages of its sessions fail as today, and repeated failures move search back. <b>Postgres and Elasticsearch's disk have no stop point:</b> exposure estimate about $11 a month at 500,000 events, which nothing enforces (the alert only warns); to accept it, write "Index search: no stop point on Postgres or Elasticsearch's disk, exposure estimate $11 a month accepted". <span class="tag">docs</span> memory and vCPU prices; disk price <span class="tag">unverified</span>.</td><td>8</td></tr>
+       <tr><td>GitHub cost</td><td>Opening issues bills nothing on the free plan.</td><td>8</td></tr>
+       <tr><td>New vendors</td><td>None.</td><td>none</td></tr>
+       <tr><td>Platform rules and terms</td><td>None: public event data only, as today.</td><td>none</td></tr>
+@@ -724,7 +725,8 @@
+       <tr data-dp="D3"><td>Earlier decisions this departs from</td><td>The Oct 13 stack (Elasticsearch 8 as the search projection, Eng directions 14) becomes Postgres first. Your sentence rule for Railway (Eng directions 3) is kept: each setting change waits for your sentence; waking a sleeping service is not a Railway change.</td><td>1</td>
+         <template data-opt="B"><td>Earlier decisions this departs from</td><td>The Oct 13 stack (Elasticsearch 8 as the search projection, Eng directions 14) becomes Postgres first. Your sentence rule for Railway (Eng directions 3 and 16) is replaced, for deploying and removing Elasticsearch only, by a standing authorization that this approval gives.</td><td>1</td></template>
+         <template data-opt="C"><td>Earlier decisions this departs from</td><td>The Oct 13 stack (Elasticsearch 8 as the search projection, Eng directions 14) becomes Postgres first. Your sentence rule for Railway (Eng directions 3) is kept.</td><td>1</td></template></tr>
+-      <tr><td>What reaches production users and when</td><td>Nothing visible. Reads switch after PR 1 and your sentence; after the production comparison, a first page Elasticsearch fails is answered from Postgres instead of failing.</td><td>7</td></tr>
++      <tr data-dp="D1"><td>What reaches production users and when</td><td>Nothing visible. Reads switch after PR 1 and your sentence; after the production comparison, a first page Elasticsearch fails is answered from Postgres instead of failing.</td><td>7</td>
++        <template data-opt="B"><td>What reaches production users and when</td><td>Live paging: once reads switch, after PR 1 and your sentence, an event edited between pages can be missed or shown twice. After the production comparison, a first page Elasticsearch fails is answered from Postgres instead of failing.</td><td>7</td></template></tr>
+       <tr><td>What is hard to undo</td><td>Nothing: the Elasticsearch service and disk stay.</td><td>7</td></tr>
+       <tr data-dp="D3"><td>Sentences you will type</td><td>In this thread, after PR 1: (1) "Set SEARCH_BACKEND_FORCE=postgres on the query service in placeproto". An hour later: (2) "Set SEARCH_ES=off on the ingester in placeproto", (3) "Turn on Serverless for the Elasticsearch service in placeproto", (4) "Set Elasticsearch's limits to 2 GB memory and 1 vCPU in placeproto". After PR 2: (5) "Clear SEARCH_BACKEND_FORCE on the query service and set the controller variables on the ingester in placeproto". By hand, before PR 2: a GitHub issues token, stored with the secrets helper. Only to roll back: "Set SEARCH_ES=on on the ingester and SEARCH_BACKEND_FORCE=elastic on the query service in placeproto".</td><td>9</td>
+         <template data-opt="B"><td>Sentences you will type</td><td>In this thread, after PR 1: (1) "Set SEARCH_BACKEND_FORCE=postgres on the query service in placeproto". An hour later: (2) "Set SEARCH_ES=off on the ingester in placeproto", (3) "Remove the Elasticsearch deployment in placeproto", (4) "Set Elasticsearch's limits to 2 GB memory and 1 vCPU in placeproto". After PR 2: (5) "Clear SEARCH_BACKEND_FORCE on the query service and set the controller variables and the Railway token on the ingester in placeproto". By hand, before PR 2: a Railway project token for placeproto production and a GitHub issues token, stored with the secrets helper. Only to roll back: "Redeploy Elasticsearch in placeproto" and "Set SEARCH_ES=on on the ingester and SEARCH_BACKEND_FORCE=elastic on the query service in placeproto".</td><td>9</td></template>
+@@ -753,8 +755,8 @@
+   <h2><span class="n">10</span>Plan and gates</h2>
+   <ol>
+     <li><b>Gate 1:</b> you approve this packet.</li>
+-    <li><b>Gate 2, PR 1</b> (about 4 to 5 days; not built if D1 is held): interface, Postgres backend, Elasticsearch optional, writes to both, the backend rule with its fill and repair passes, cursor field, read switch, double-run tests. PR review, deploy, production comparison, then your sentences (part 8) switch reads and turn Elasticsearch off. You see it on Railway's usage page and in the acceptance check.</li>
+-    <li><b>Gate 3, PR 2</b> (about 2 to 4 days; if D2 is held, stats only and no controller; not built if D1 is held): stats, controller, GitHub issues. PR review. A forced dry run, with thresholds set low on a copy of the settings, walks every state once before the real thresholds go in.</li>
++    <li><b>Gate 2, PR 1</b> (about 4 to 5 days; not built if D1 is held): interface, Postgres backend, Elasticsearch optional, writes to both, the backend rule with its fill and repair passes, cursor field, read switch, double-run tests. PR review, then your merge word (risk medium or higher), deploy, production comparison, then your sentences (part 8) switch reads and turn Elasticsearch off. You see it on Railway's usage page and in the acceptance check.</li>
++    <li><b>Gate 3, PR 2</b> (about 2 to 4 days; if D2 is held, stats only and no controller; not built if D1 is held): stats, controller, GitHub issues. PR review, then your merge word. A forced dry run, with thresholds set low on a copy of the settings, walks every state once before the real thresholds go in.</li>
+   </ol>
+   <p class="small">Who builds: this thread. No dependency on other threads; under D3 A this thread also sets up the weekly sleep check at gate 2. The cost thread's heap cut is independent. No outside dates.</p>
+ </section>
+@@ -762,7 +764,7 @@
+ <!-- ===================== 11 REVIEW ===================== -->
+ <section class="part" id="p11">
+   <h2><span class="n">11</span>Review before the gate</h2>
+-  <p id="review-card">Seven rounds by an independent Claude reviewer (v1 to v7) found 5 blockers and 29 should-fixes, all fixed; from round 3 the readiness patches were replaced by one rule (part 4). Then Codex Astra reviewed v7 on your Mac: 1 blocker (Elasticsearch's own version numbers could never match Postgres's), 9 should-fixes and 2 nits, all fixed in this version. Reviews <a href="files/REVIEW-v7.md">Claude round 7</a> (earlier rounds linked from it) and <a href="files/CODEX-REVIEW-v7.md">Codex</a>; triage <a href="files/CODEX-TRIAGE-v8.md">for this version</a>. Codex reviews this build next.</p>
++  <p id="review-card">Seven rounds by an independent Claude reviewer (v1 to v7) found 5 blockers and 29 should-fixes, all fixed; from round 3 the readiness patches were replaced by one rule (part 4). Codex Astra then reviewed on your Mac: v7 had 1 blocker (Elasticsearch's own version numbers could never match Postgres's), 9 should-fixes and 2 nits; v8 had no blocker, 9 should-fixes and 2 nits. All are fixed in this version. Reviews <a href="files/REVIEW-v7.md">Claude round 7</a>, Codex <a href="files/CODEX-REVIEW-v7.md">round 1</a> and <a href="files/CODEX-REVIEW-v8.md">round 2</a>; triages <a href="files/CODEX-TRIAGE-v8.md">1</a> and <a href="files/CODEX-TRIAGE-v9.md">2</a>. Codex reviews this build next.</p>
+ </section>
+ 
+ <!-- ===================== 12 RECORD ===================== -->
+@@ -800,7 +802,7 @@
+     </tbody>
+   </table></div>
+   </details>
+-  <p class="small muted">Reverse check: claims in parts 2 to 10 were looked up in the spec; those that are packet-only are the 12-month deferral (part 5), the effort ranges (parts 6 and 10) and the forced dry run (part 10), which are plans of this thread, not spec requirements. Spec draft v8 in <a href="files/spec.md">files/</a>; links checked Nov 16.</p>
++  <p class="small muted">Reverse check: claims in parts 2 to 10 were looked up in the spec; those that are packet-only are the 12-month deferral (part 5), the effort ranges (parts 6 and 10) and the forced dry run (part 10), which are plans of this thread, not spec requirements. Spec draft v9 in <a href="files/spec.md">files/</a>; links checked Nov 16.</p>
+ </section>
+ 
+ <!-- ===================== 14 GLOSSARY ===================== -->

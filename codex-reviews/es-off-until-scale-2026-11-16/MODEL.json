@@ -1,10 +1,10 @@
 {
  "proposal": "search-without-elasticsearch",
- "version": "v8",
+ "version": "v9",
  "spec": "spec",
- "build": "f476432",
+ "build": "d1afd7c",
  "specFile": "spec.md",
- "specSha": "55c064ce2b9290e275c2cab06fbdef896cd60ba4941eca1d9c4a62987d17bce1",
+ "specSha": "0110833108382dddfa3dac817e2a85517b9aa26cea154d3c1b9ef57826e684b7",
  "decisions": [
   {
    "id": "D1",
@@ -124,13 +124,6 @@
       "D1 hold"
      ],
      "why": "With paging held, search stays on Elasticsearch and no trigger is built, so there is nothing to turn on."
-    },
-    {
-     "dec": "D3",
-     "when": [
-      "D2 hold"
-     ],
-     "why": "With the trigger's measure held, nothing ever switches, so how Elasticsearch turns on has nothing to decide."
     }
    ]
   }
