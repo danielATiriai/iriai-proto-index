@@ -13,7 +13,7 @@ import { bindingOf, parseEventQuery } from '../src/query/params.js'
 import { createQueryServer } from '../src/query/server.js'
 import { XrpcError, getEvent, queryEvents, type QueryDeps, type Search } from '../src/query/service.js'
 import { bindingHash } from '../src/query/cursor.js'
-import { SearchControl, readControl } from '../src/search/control.js'
+import { SearchControl, controlPool, readControl } from '../src/search/control.js'
 import { PostgresBackend, pageSql, searchPool } from '../src/search/postgres.js'
 import { SearchUpkeep, comparable } from '../src/search/verify.js'
 import { EVENT, SIDECAR, eventValue, geo, sidecarValue } from './fixtures.js'
@@ -175,6 +175,10 @@ describe('Postgres search backend', { skip: !databaseUrl && 'TEST_DATABASE_URL n
       await client.query('set enable_seqscan = off; set enable_bitmapscan = off; set enable_sort = off')
       const plan = (await client.query(`explain ${text}`, values)).rows.map((r) => r['QUERY PLAN']).join('\n')
       assert.match(plan, /event_docs_current_start/)
+      // The current-rows branch walks the index in order: no Sort between its Limit and the scan.
+      const current = plan.slice(plan.indexOf('*SELECT* 1'), plan.indexOf('*SELECT* 2'))
+      assert.ok(current.includes('event_docs_current_start'), current)
+      assert.ok(!/Sort/.test(current.replace(/Sort Key: .*$/gm, '').replace(/Sort Method: .*$/gm, '')), `the current-rows branch sorts:\n${current}`)
     } finally {
       await client.query('reset enable_seqscan; reset enable_bitmapscan; reset enable_sort').catch(() => {})
       client.release()
@@ -476,6 +480,73 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     }
   })
 
+  it('migrates again without locking ingestion tables an older writer holds', async () => {
+    const old = new pg.Client({ connectionString: dbUrl('routing_test') })
+    await old.connect()
+    try {
+      await old.query('begin')
+      await old.query('lock table checkpoints in row exclusive mode')
+      const done = await Promise.race([migrate(db).then(() => true), new Promise((r) => setTimeout(() => r(false), 3_000))])
+      assert.equal(done, true, 'a repeat migration waited on checkpoints')
+    } finally {
+      await old.query('rollback').catch(() => {})
+      await old.end()
+    }
+  })
+
+  it('reports new sessions as not served in health when search_control answers too slowly, Elasticsearch chosen', async () => {
+    const slow = { ...search, control: slowControl(650) }
+    await assert.rejects(ask(PARAMS, undefined, { ...deps, search: slow }), unavailable)
+    const server = createQueryServer({ db, search: slow, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    try {
+      const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/xrpc/_health`)
+      const body = (await res.json()) as { index: { ok: boolean }; getEvent: { ok: boolean; backend: string } }
+      assert.equal(body.index.ok, false)
+      assert.deepEqual({ ok: body.getEvent.ok, backend: body.getEvent.backend }, { ok: true, backend: 'elastic' })
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
+
+  it('answers every first page within seconds while another transaction holds the control row', async () => {
+    await setVerified(true)
+    await db.query(`update search_control set elastic_cursors_until = now() + interval '5 minutes'`)
+    const pool = controlPool(dbUrl('routing_test'))
+    const holder = new pg.Client({ connectionString: dbUrl('routing_test') })
+    await holder.connect()
+    try {
+      await holder.query('begin')
+      await holder.query('update search_control set updated_at = now()')
+      const control = new SearchControl(pool)
+      const started = Date.now()
+      const results = await Promise.allSettled(
+        Array.from({ length: 12 }, () => ask(PARAMS, undefined, { ...deps, search: { ...search, control } })),
+      )
+      const took = Date.now() - started
+      assert.ok(took < 5_000, `took ${took} ms`)
+      // The cover cannot be written, so Elasticsearch does not serve; the verified Postgres does.
+      assert.ok(results.every((r) => r.status === 'fulfilled'), JSON.stringify(results.map((r) => r.status)))
+    } finally {
+      await holder.query('rollback').catch(() => {})
+      await holder.end()
+      await pool.end()
+    }
+  })
+
+  it('looks at verification again before falling back to Postgres', async () => {
+    await setVerified(true)
+    const clearing = {
+      name: 'elastic',
+      get: async () => {
+        await db.query('update search_control set pg_verified = false')
+        throw new Error('connect ECONNREFUSED')
+      },
+    } as unknown as ElasticBackend
+    await assert.rejects(getEvent({ ...deps, search: { ...search, elastic: clearing } }, uriOf(2)), unavailable)
+    await setVerified(true)
+  })
+
   it('covers cursors from a previous deployment when it starts', async () => {
     await db.query(`update search_control set elastic_cursors_until = now() - interval '5 minutes'`)
     await migrate(db)
@@ -577,25 +648,31 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await db.end()
   })
 
-  it('fills Postgres from index_state, compares it with today\'s index, and latches verified', async () => {
+  it('fills Postgres from index_state, compares it with today\'s index, and records verified', async () => {
     const log: string[] = []
     const upkeep = new SearchUpkeep(db, projector, (m) => log.push(m))
     await upkeep.run()
     const row = await readControl(db)
     assert.equal(row.firstFillDone, true)
-    assert.equal(row.pgVerified, true, row.note ?? '')
+    assert.equal(row.pgVerified, true, `${row.note} / ${log.join(' / ')}`)
     assert.match(row.note!, /3 documents/)
     assert.equal(await projector.postgres.count(), 3)
 
-    // Verified stays set, even if a later comparison would not pass.
-    await projector.postgres.remove(`at://${AUTHOR}/${SIDECAR}/3ks1`)
+    // A later comparison that does not pass clears it (only upkeep's first
+    // comparison runs while verified, as another ingester verifies meanwhile).
+    const removed = (await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks1`))!
+    await projector.postgres.remove(removed.uri)
     const again = await upkeep.compare()
     assert.equal(again.ok, false)
+    assert.equal((await readControl(db)).pgVerified, false)
+    await projector.postgres.put(removed)
+    assert.equal((await upkeep.compare()).ok, true)
     assert.equal((await readControl(db)).pgVerified, true)
   })
 
   it('names what differs, and compares again only after an hour', async () => {
     await db.query('update search_control set pg_verified = false, compared_at = null')
+    await projector.postgres.remove(`at://${AUTHOR}/${SIDECAR}/3ks1`)
     await projector.postgres.put({ ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks2`))!, eventCid: 'bafychanged' })
     let now = Date.now()
     const upkeep = new SearchUpkeep(db, projector, () => {}, () => now)
@@ -697,6 +774,37 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     }
     await upkeep.run()
     assert.equal((await readControl(db)).pgVerified, true)
+  })
+
+  it('never writes a projection over a later one, whichever ingester started first', async () => {
+    const s3 = `at://${AUTHOR}/${SIDECAR}/3ks3`
+    // Ingester A's fill reaches the write lock only after ingester B has
+    // deleted the sidecar's record: A must write what the records say then.
+    const holder = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+    await holder.connect()
+    await holder.query('begin')
+    await holder.query('select pg_advisory_xact_lock($1)', [7140015])
+    const fill = projector.fillPostgres(s3)
+    await new Promise((r) => setTimeout(r, 200))
+    await db.query(`update records set deleted = true, value = null where uri = $1`, [s3])
+    await holder.query('commit')
+    await holder.end()
+    await fill
+    assert.equal(await projector.postgres.get(s3), undefined)
+    // Ingester B's own projection of the delete agrees.
+    await projector.projectSidecar(s3, { hydrate: false })
+    assert.equal(await projector.postgres.get(s3), undefined)
+  })
+
+  it('clears verification when a comparison fails, whoever set it', async () => {
+    await db.query('update search_control set pg_verified = true, first_fill_done = true, compared_at = null')
+    const upkeep = new SearchUpkeep(db, projector, () => {})
+    const extra = { ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks1`))!, uri: `at://${AUTHOR}/${SIDECAR}/3ksextra` }
+    await projector.postgres.put(extra)
+    const res = await upkeep.compare()
+    assert.equal(res.ok, false)
+    assert.equal((await readControl(db)).pgVerified, false)
+    await projector.postgres.remove(extra.uri)
   })
 
   it('ignores indexedAt and key order when comparing', () => {

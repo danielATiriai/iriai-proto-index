@@ -131,10 +131,15 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
       elasticCursorsUntil: row.elasticCursorsUntil.toISOString(),
     }
   } catch {
-    // Unreadable search_control counts as unverified, as in routing, so
-    // health still asks the backend that would serve.
+    // Unreadable search_control: no new session can be served (a verified
+    // Postgres cannot be shown, and an Elasticsearch session cannot be
+    // covered), so index is not ok. getEvent still routes as unverified, so
+    // health reports the backend that would answer it.
     out.search = { unavailable: true }
-    backend = route(search.force, { pgVerified: false })?.backend
+    out.index = { ok: false, reason: 'search_control unavailable: new sessions are refused' }
+    const forGet = route(search.force, { pgVerified: false })?.backend
+    out.getEvent = forGet === 'elastic' ? await countOn(search.elastic) : { ok: false }
+    return { ...out, ...(deps.health?.() ?? {}) }
   }
   // Elasticsearch not answering within 2 seconds hands new sessions to a
   // verified Postgres, so health reports Postgres then, as routing does.

@@ -1,3 +1,4 @@
+import pg from 'pg'
 import type { Db } from '../db.js'
 import type { BackendName } from './backend.js'
 
@@ -22,8 +23,19 @@ const READ_EVERY_MS = 30_000
 export const CONTROL_MS = 500
 /** Every Elasticsearch first page leaves at least this long for its session (spec 3). */
 const COVER_MS = 61 * 60_000
-/** Extending once a minute is enough: a session never outlives 60 of the 61 minutes. */
+/** Extending when under 60 minutes remain is enough: a session never outlives 60 of the 61 minutes. */
 const EXTEND_BELOW_MS = 60 * 60_000
+
+/**
+ * The query service's own small pool for search_control: two connections,
+ * each statement and each connection wait cut off at 500 ms, so a stalled
+ * read is stopped in the database too, not only no longer awaited.
+ */
+export function controlPool(databaseUrl: string, log: (msg: string) => void = console.error): Db {
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 2, statement_timeout: CONTROL_MS, connectionTimeoutMillis: CONTROL_MS })
+  pool.on('error', (err) => log(`postgres (search control): idle client lost: ${err.message}`))
+  return pool
+}
 
 export async function readControl(db: Db): Promise<ControlRow> {
   const res = await db.query<{
@@ -81,8 +93,8 @@ export class SearchControl {
 
   /**
    * Called before an Elasticsearch first page returns: moves
-   * elastic_cursors_until to at least now + 61 minutes, with one row update at
-   * most once a minute.
+   * elastic_cursors_until to at least now + 61 minutes, writing the row only
+   * when less than 60 minutes remain.
    */
   async coverElasticSession(): Promise<void> {
     const row = await this.current()

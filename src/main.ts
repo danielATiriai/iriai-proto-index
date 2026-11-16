@@ -4,7 +4,7 @@ import { ElasticBackend, connectElastic } from './index/elastic.js'
 import { Ingester } from './ingest/ingester.js'
 import { Projector } from './ingest/projector.js'
 import { createQueryServer } from './query/server.js'
-import { SearchControl } from './search/control.js'
+import { SearchControl, controlPool } from './search/control.js'
 import { PostgresBackend, searchPool } from './search/postgres.js'
 import { loadSettings } from './settings.js'
 
@@ -22,7 +22,7 @@ await waitFor('PostgreSQL', () => migrate(db))
 log(
   (await searchWriterSeen(db))
     ? 'search: this service\'s connections are marked as writers of event_docs'
-    : 'search: WARNING: iriai.search_writer is not set on this service\'s connections (a pooler may drop it); Postgres will not be verified',
+    : 'search: WARNING: iriai.search_writer is not set on this service\'s connections (a pooler may drop it); each ingestion write will clear Postgres\'s verification',
 )
 
 let ingester: Ingester | undefined
@@ -47,7 +47,7 @@ const server =
         search: {
           elastic: new ElasticBackend(es, settings.elasticIndex),
           postgres: new PostgresBackend(db, searchPool(settings.databaseUrl, log)),
-          control: new SearchControl(db),
+          control: new SearchControl(controlPool(settings.databaseUrl, log)),
           force: settings.searchBackendForce,
         },
         ...settings,

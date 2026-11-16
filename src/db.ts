@@ -131,8 +131,10 @@ create index if not exists event_docs_closed_span on event_docs using gist (even
 create index if not exists event_docs_closed_at on event_docs (closed_at) where closed_version is not null;
 
 -- Search routing state, one row (spec 6; PR 2 adds the controller's columns).
--- elastic_cursors_until: Elasticsearch cursors are honored until then; the
--- first migration covers cursors issued before it.
+-- elastic_cursors_until: Elasticsearch cursors are honored until then (the
+-- row and its cover are written after this script; see migrate()).
+-- generation: moved on by every change to an ingestion table from code that
+-- does not write event_docs.
 create table if not exists search_control (
   id integer primary key check (id = 1),
   elastic_cursors_until timestamptz not null,
@@ -140,50 +142,47 @@ create table if not exists search_control (
   pg_verified boolean not null default false,
   compared_at timestamptz,
   note text,
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  generation bigint not null default 0
 );
--- Every start covers the hour of Elasticsearch cursors that a previous
--- deployment (which may not have recorded them) could have issued.
-insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes')
-  on conflict (id) do update set elastic_cursors_until = greatest(search_control.elastic_cursors_until, excluded.elastic_cursors_until);
 
--- Code that changes index_state without writing event_docs (this service
--- before search on Postgres, say after a revert) leaves event_docs stale. Any
--- such change clears the first fill and verification, so the next start fills
--- event_docs again and compares before Postgres may serve.
-alter table search_control add column if not exists generation bigint not null default 0;
+-- Code that changes an ingestion table without writing event_docs (this
+-- service before search on Postgres, say after a revert) leaves event_docs
+-- stale. Any such change clears the first fill and verification, so the
+-- next upkeep fills event_docs again and compares before Postgres may serve.
+-- Every table the ingester writes is watched, not only index_state: older
+-- code changes records or accounts first and may fail before index_state.
 create or replace function search_foreign_write() returns trigger language plpgsql as $fn$
 begin
   if coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
     update search_control
       set first_fill_done = false, pg_verified = false, compared_at = null, generation = generation + 1,
-          updated_at = now(), note = 'index_state was changed by code that does not write event_docs; filling again'
+          updated_at = now(), note = 'ingestion tables were changed by code that does not write event_docs; filling again'
       where id = 1;
   end if;
   return null;
 end
 $fn$;
--- Every table the ingester writes, not only index_state: code that does not
--- write event_docs (an older deploy) changes records or accounts first, and
--- may fail before index_state, yet Postgres is already behind (the rule
--- fails closed: any such write sends Postgres back through fill and compare).
-create or replace trigger index_state_foreign_write after insert or update or delete on index_state
-  for each statement execute function search_foreign_write();
-create or replace trigger records_foreign_write after insert or update or delete on records
-  for each statement execute function search_foreign_write();
-create or replace trigger accounts_foreign_write after insert or update or delete on accounts
-  for each statement execute function search_foreign_write();
-create or replace trigger checkpoints_foreign_write after insert or update or delete on checkpoints
-  for each statement execute function search_foreign_write();
-create or replace trigger skipped_events_foreign_write after insert or update or delete on skipped_events
-  for each statement execute function search_foreign_write();
+-- Created only when missing: replacing a trigger locks its table, and an
+-- older writer already inside the trigger (waiting on search_control) would
+-- then deadlock with this script.
+do $do$
+declare t text;
+begin
+  foreach t in array array['index_state', 'records', 'accounts', 'checkpoints', 'skipped_events'] loop
+    if not exists (select 1 from pg_trigger where tgname = t || '_foreign_write' and tgrelid = t::regclass) then
+      execute format('create trigger %I after insert or update or delete on %I for each statement execute function search_foreign_write()', t || '_foreign_write', t);
+    end if;
+  end loop;
+end
+$do$;
 `
 
 /**
  * Whether this pool's connections carry iriai.search_writer=1 as the server
- * sees it. A connection pooler that drops start-up options would make every
- * write of this code look foreign: Postgres would then never be verified,
- * which fails closed, and start-up logs it.
+ * sees it. A connection pooler that drops start-up options would make this
+ * code's ingestion writes look foreign: each would clear verification, which
+ * fails closed, and start-up logs it.
  */
 export async function searchWriterSeen(db: Db): Promise<boolean> {
   const res = await db.query<{ v: string | null }>(`select current_setting('iriai.search_writer', true) as v`)
@@ -195,6 +194,13 @@ export async function migrate(db: Db): Promise<void> {
   try {
     await client.query('select pg_advisory_lock(7140014)')
     await client.query(MIGRATION)
+    // Last, on its own: every start covers the hour of Elasticsearch cursors
+    // a previous deployment (which may not have recorded them) could have
+    // issued. Nothing above holds search_control's row while tables are locked.
+    await client.query(
+      `insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes')
+       on conflict (id) do update set elastic_cursors_until = greatest(search_control.elastic_cursors_until, excluded.elastic_cursors_until)`,
+    )
   } finally {
     await client.query('select pg_advisory_unlock(7140014)').catch(() => {})
     client.release()

@@ -71,13 +71,11 @@ export class Projector {
     const { db } = this.deps
     const done: { uri: string; doc?: EventDoc; hydrate?: string }[] = []
     for (const uri of uris) {
-      const { result, did } = await this.assembleStored(uri)
+      const { result, did } = await this.projectPostgres(uri)
       if (result.complete) {
-        await this.postgres.put(result.doc)
         await setIndexState(db, uri, did, true, null)
         done.push({ uri, doc: result.doc })
       } else {
-        await this.postgres.remove(uri)
         await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
         done.push({ uri, hydrate: result.hydrate })
       }
@@ -97,13 +95,18 @@ export class Projector {
    * the same state, and index_state is left as it is.
    */
   async fillPostgres(uri: string): Promise<void> {
-    const { result } = await this.assembleStored(uri)
-    if (result.complete) await this.postgres.put(result.doc)
-    else await this.postgres.remove(uri)
+    await this.projectPostgres(uri)
   }
 
-  private async assembleStored(uri: string) {
-    const { db } = this.deps
+  /** Assembles uri from stored records and writes it to Postgres, as one step under the write lock. */
+  private async projectPostgres(uri: string) {
+    return this.postgres.project(uri, async (q) => {
+      const assembled = await this.assembleStored(uri, q)
+      return { ...assembled, doc: assembled.result.complete ? assembled.result.doc : undefined }
+    })
+  }
+
+  private async assembleStored(uri: string, db: Db = this.deps.db) {
     const sidecar = await getRecord(db, uri)
     const event = sidecar?.event_uri ? await getRecord(db, sidecar.event_uri) : undefined
     const servable = sidecar ? await isAccountServable(db, sidecar.did) : true

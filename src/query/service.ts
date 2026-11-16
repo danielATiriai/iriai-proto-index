@@ -77,7 +77,9 @@ async function routed<T>(search: Search, run: (backend: SearchBackend, opts: Cal
     search.last = { ...chosen, at: new Date().toISOString() }
     return result
   } catch (err) {
-    if (!row.pgVerified) throw toUnavailable(err)
+    // Looked at again before falling back: verification may have been
+    // cleared during the Elasticsearch attempt.
+    if (!row.pgVerified || !(await verification(search)).pgVerified) throw toUnavailable(err)
     search.last = { backend: 'postgres', reason: 'Elasticsearch failed or took over 2 s; Postgres verified', at: new Date().toISOString() }
     return unavailableOnFailure(() => run(search.postgres, {}))
   }

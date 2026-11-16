@@ -43,26 +43,25 @@ export class PostgresBackend implements SearchBackend {
     private reads: Db = db,
   ) {}
 
+  /**
+   * Writes uri's projection as `assemble` finds it inside the write's
+   * transaction, under the write lock: what it reads is the stored records as
+   * of that moment, so a projection that started earlier can never be written
+   * over a later one, whichever ingester made each (two run at once while a
+   * deploy overlaps). Returns what was assembled.
+   */
+  async project<T extends { doc?: EventDoc }>(uri: string, assemble: (q: Db) => Promise<T>): Promise<T> {
+    let out: T | undefined
+    await this.write(uri, async (client, version) => {
+      out = await assemble(client as unknown as Db)
+      if (out.doc) await insertDoc(client, version, out.doc)
+    })
+    return out!
+  }
+
   /** Replaces the current row for doc.uri; returns the write's version. */
   async put(doc: EventDoc): Promise<bigint> {
-    return this.write(doc.uri, async (client, version) => {
-      await client.query(
-        `insert into event_docs (uri, version, did, event_uri, doc, lat, lon, starts_at, ends_at, time_valid)
-         values ($1, $2, $3, $4, $5, $6, $7, ${FROM_MS('$8')}, ${FROM_MS('$9')}, $10)`,
-        [
-          doc.uri,
-          version,
-          doc.did,
-          doc.eventUri,
-          JSON.stringify(doc),
-          doc.point?.lat ?? null,
-          doc.point?.lon ?? null,
-          ms(doc.startsAt),
-          ms(doc.endsAt),
-          doc.timeValid,
-        ],
-      )
-    })
+    return this.write(doc.uri, (client, version) => insertDoc(client, version, doc))
   }
 
   /** Closes the current row for uri, if any; returns the write's version. */
@@ -162,6 +161,25 @@ export class PostgresBackend implements SearchBackend {
   }
 }
 
+async function insertDoc(client: pg.PoolClient, version: string, doc: EventDoc): Promise<void> {
+  await client.query(
+    `insert into event_docs (uri, version, did, event_uri, doc, lat, lon, starts_at, ends_at, time_valid)
+     values ($1, $2, $3, $4, $5, $6, $7, ${FROM_MS('$8')}, ${FROM_MS('$9')}, $10)`,
+    [
+      doc.uri,
+      version,
+      doc.did,
+      doc.eventUri,
+      JSON.stringify(doc),
+      doc.point?.lat ?? null,
+      doc.point?.lon ?? null,
+      ms(doc.startsAt),
+      ms(doc.endsAt),
+      doc.timeValid,
+    ],
+  )
+}
+
 /** An ISO time as epoch milliseconds, for binding; undefined stays null. */
 function ms(iso: string | undefined): string | null {
   if (iso === undefined) return null
@@ -236,8 +254,9 @@ export function pageSql(snapshot: string, q: EventQuery, after: unknown[] | unde
   const where = (visible: string) => [visible, ...filters].join(' and ')
   const current = `closed_version is null and version <= ${w}`
   const closed = `closed_version is not null and version <= ${w} and closed_version > ${w}`
-  // Each branch orders by the column itself, so the (starts_at, uri) index
-  // serves it; the merged rows are then ordered by the returned key.
+  // Each branch orders by the column itself, so the current-rows branch can
+  // walk the (starts_at, uri) index (closed rows have no start-time index and
+  // are few); the merged rows are then ordered by the returned key.
   const branchOrder = key ? `order by ${key} asc nulls last, uri asc` : 'order by uri asc'
   const order = key ? 'order by k asc nulls last, uri asc' : 'order by uri asc'
   const limit = `limit ${p(size, '::int')}`

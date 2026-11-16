@@ -63,9 +63,10 @@ export class SearchUpkeep {
   /**
    * Compares Postgres's current documents with today's index by document id
    * and content (not versions, and not indexedAt, which records when each
-   * copy was written). A pass sets pg_verified only if the fill is done and
-   * the generation has not moved since the comparison began; only a change
-   * from code that does not write event_docs clears it.
+   * copy was written). The result is recorded only if the fill is done and
+   * the generation has not moved since the comparison began: a pass sets
+   * pg_verified, and a failure clears it, whoever set it (another ingester
+   * during a deploy overlap, say).
    */
   async compare(): Promise<{ ok: boolean; note: string }> {
     let ok = false
@@ -92,7 +93,7 @@ export class SearchUpkeep {
       note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying in an hour'
     }
     const res = await this.db.query(
-      `update search_control set pg_verified = pg_verified or $1, compared_at = now(), note = $2, updated_at = now()
+      `update search_control set pg_verified = $1, compared_at = now(), note = $2, updated_at = now()
        where id = 1 and generation = $3 and first_fill_done`,
       [ok, note, generation],
     )
