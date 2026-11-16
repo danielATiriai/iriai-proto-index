@@ -1,7 +1,7 @@
 decision impact: 3 decisions, 20 decision points, 2 relations; option rows, decision points, spec decision points and relations pass
 diagram font IBM Plex Sans loaded before measuring: yes
-build d62a361
-default reading: 2283 words (folds closed, before the appendix)
+build facd495
+default reading: 2319 words (folds closed, before the appendix)
 diagram 4a: natural width 977 px; labels at 390 fitted about 5.5 px; in-words list: yes; full size: files/diagram-4a.png
 diagram 4b: natural width 951 px; labels at 390 fitted about 5.7 px; in-words list: yes; full size: files/diagram-4b.png
 diagram 4c: natural width 820 px; labels at 390 fitted about 6.6 px; in-words list: yes; full size: files/diagram-4c.png
@@ -11,13 +11,13 @@ first screen 390x844: decision table ends at 808 px (inside the first screen)
 state loading: Record off; status "Connecting to the record store…"
 state ready: Record on; status "Open a decision to change or hold it, pick your verdict, then tap Record."
 state deciding: Record on; status "Open a decision to change or hold it, pick your verdict, then tap Record."
-state saving: Record off; status "Recording r-8c3eb19c80426c5adba43a24… controls are locked until the store answers (at most 15 seconds)."
-state stalled: Record on; status "The store has not confirmed r-13eaf3950e77a22d67d862dc after 15 seconds. Your choices are still here. If r-13eaf3950e77a22d67d862dc appears under the decisions it was recorded; if not, tap Record again (a new receipt) or answer in the thread."
-state pending: Record on; status "The store has not confirmed r-af96823c777ca142fdb28428 after 15 seconds. Your choices are still here. If r-af96823c777ca142fdb28428 appears under the decisions it was recorded; if not, tap Record again (a new receipt) or answer in the thread."
-state late: Record on; status "Receipt r-0e673a843852c1cd6e7ebac9 was recorded late, with the choices you had before your later changes. Your current choices are not recorded: tap Record to record them, or send the line below to answer with the earlier ones."
-state failed: Record on; status "Recording r-fab1de845f60d6b6e3ba95ce failed (unavailable). Your choices are still here. If r-fab1de845f60d6b6e3ba95ce appears under the decisions it was recorded anyway; if not, try again or answer in the thread."
-state recorded: Record on; status "Recorded Nov 16, 6:04 AM UTC as receipt r-950a8b0e12f4d7934ecf733f. Not yet counted: send the line below in the thread."
-state changes: Record on; status "Recorded Nov 16, 6:04 AM UTC as receipt r-4afcd5335181adee2cc829af. Not yet counted: send the line below in the thread."
+state saving: Record off; status "Recording r-14f99baef1bb27885515d49a… controls are locked until the store answers (at most 15 seconds)."
+state stalled: Record on; status "The store has not confirmed r-5681bc6a47e694ad37aa4820 after 15 seconds. Your choices are still here. If r-5681bc6a47e694ad37aa4820 appears under the decisions it was recorded; if not, tap Record again (a new receipt) or answer in the thread."
+state pending: Record on; status "The store has not confirmed r-8feb1e74450e1eb750bda283 after 15 seconds. Your choices are still here. If r-8feb1e74450e1eb750bda283 appears under the decisions it was recorded; if not, tap Record again (a new receipt) or answer in the thread."
+state late: Record on; status "Receipt r-43673a7e1d63ee1134116469 was recorded late, with the choices you had before your later changes. Your current choices are not recorded: tap Record to record them, or send the line below to answer with the earlier ones."
+state failed: Record on; status "Recording r-a293cbd1d9b8be9ecdca6a12 failed (unavailable). Your choices are still here. If r-a293cbd1d9b8be9ecdca6a12 appears under the decisions it was recorded anyway; if not, try again or answer in the thread."
+state recorded: Record on; status "Recorded Nov 16, 6:29 AM UTC as receipt r-1b90b8b0f893748b21007be5. Not yet counted: send the line below in the thread."
+state changes: Record on; status "Recorded Nov 16, 6:29 AM UTC as receipt r-299dd2179fa2f9820ce74bbf. Not yet counted: send the line below in the thread."
 state refused: Record on; status "Refused: you held D1 but the verdict is not "Approve in part"."
 state newer: Record on; status "Not recorded yet: a newer record exists. Tap "Record as newest" to record yours after it."
 state competing: Record on; status "Two records compete; none is loaded. Record a newer one, or tell the thread which stands."
@@ -27,7 +27,7 @@ state readonly: Record off; status "You can read the decisions and any record, b
 state unavailable: Record off; status "The record store has not answered. Answer in the thread instead; nothing here is lost."
 390 page horizontal overflow (live page, decisions sheet open, every fold open): false
 option renders: 7 written (option-D1-B.png, option-D1-hold.png, option-D2-B.png, option-D2-hold.png, option-D3-B.png, option-D3-C.png, option-D3-hold.png)
-files/ links: 33, missing: none
-tests: Record tests, 1200 wide: pass (28/28 pass -> /tmp/claude-0/-home-user/757b51d8-cc75-52a5-b0e2-ea1690632ded/scratchpad/out-v10/files/REPRO.txt)
-tests: Record tests, 390 wide: pass (28/28 pass -> /tmp/claude-0/-home-user/757b51d8-cc75-52a5-b0e2-ea1690632ded/scratchpad/out-v10/files/REPRO-390.txt)
+files/ links: 35, missing: none
+tests: Record tests, 1200 wide: pass (28/28 pass -> /tmp/claude-0/-home-user/757b51d8-cc75-52a5-b0e2-ea1690632ded/scratchpad/out-v11/files/REPRO.txt)
+tests: Record tests, 390 wide: pass (28/28 pass -> /tmp/claude-0/-home-user/757b51d8-cc75-52a5-b0e2-ea1690632ded/scratchpad/out-v11/files/REPRO-390.txt)
 tests: packet tests: pass (12/12 pass)

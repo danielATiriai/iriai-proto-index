@@ -1,10 +1,10 @@
 {
  "proposal": "search-without-elasticsearch",
- "version": "v10",
+ "version": "v11",
  "spec": "spec",
- "build": "d62a361",
+ "build": "facd495",
  "specFile": "spec.md",
- "specSha": "aa234c64efd6fb9e16b5660ea95fb8ec9ea648bfa922ca3dfd12cd7cbac56c70",
+ "specSha": "1b8cc9219ac3c05b0917766bc864bc587d63a2ea83320da64cda9e9ddc03faea",
  "decisions": [
   {
    "id": "D1",
