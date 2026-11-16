@@ -143,7 +143,8 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
       try {
         return { backend: b, ...(await b.page(snap, q, undefined, q.limit + 1, opts)) }
       } catch (err) {
-        await b.closeSnapshot(snap).catch(() => {})
+        // Not awaited: closing must not hold up the fallback (spec 5.2).
+        void b.closeSnapshot(snap).catch(() => {})
         throw err
       }
     }))

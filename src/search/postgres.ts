@@ -169,10 +169,12 @@ export function pageSql(snapshot: string, q: EventQuery, after: unknown[] | unde
   const w = p(snapshot, '::bigint')
 
   const filters: string[] = []
-  const origin = q.latitude !== undefined ? { lat: p(q.latitude, '::float8'), lon: p(q.longitude, '::float8') } : undefined
-  const distance = origin ? `arc_m(${origin.lat}, ${origin.lon}, lat, lon)` : undefined
+  // The coordinate is bound only when a radius or distance order uses it:
+  // Postgres refuses a parameter the statement never mentions.
+  const usesOrigin = q.latitude !== undefined && (q.radiusMeters !== undefined || q.sort === 'distance')
+  const distance = usesOrigin ? `arc_m(${p(q.latitude, '::float8')}, ${p(q.longitude, '::float8')}, lat, lon)` : undefined
 
-  if (q.radiusMeters !== undefined && origin) {
+  if (q.radiusMeters !== undefined && distance) {
     const r = p(q.radiusMeters, '::float8')
     const lat = q.latitude!
     filters.push(

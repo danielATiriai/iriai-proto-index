@@ -8,7 +8,8 @@ import { readCheckpoint } from '../ingest/store.js'
 import { CursorError } from './cursor.js'
 import { Limits } from './limits.js'
 import { InvalidRequest, parseEventQuery } from './params.js'
-import { XrpcError, getEvent, queryEvents, type QueryDeps, type Search } from './service.js'
+import type { CallOptions, SearchBackend } from '../search/backend.js'
+import { ELASTIC_FIRST_MS, XrpcError, getEvent, queryEvents, type QueryDeps, type Search } from './service.js'
 
 const contracts = JSON.parse(readFileSync(`${contractsRoot}SOURCE.json`, 'utf8')) as { tag: string; sha256: string }
 const ACCESS = 'Interim: open access with no key and per-caller rate limits (D-14). A project key and higher limits come with MVP.'
@@ -112,10 +113,12 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   // the state behind that choice (spec 5.3, as PR 1 has it).
   const { search } = deps
   let backend: string | undefined
+  let pgVerified = false
   try {
     const row = await search.control.refresh()
     const chosen = route(search.force, row)
     backend = chosen?.backend
+    pgVerified = row.pgVerified
     out.search = {
       force: search.force,
       chosen: chosen ?? null,
@@ -130,13 +133,25 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   } catch {
     out.search = { unavailable: true }
   }
-  try {
-    if (!backend) throw new Error('no backend may serve')
-    out.index = { ok: true, backend, events: await (backend === 'postgres' ? search.postgres : search.elastic).count() }
-  } catch {
-    out.index = { ok: false, ...(backend ? { backend } : {}) }
+  // Elasticsearch not answering within 2 seconds hands new sessions to a
+  // verified Postgres, so health reports Postgres then, as routing does.
+  if (!backend) out.index = { ok: false }
+  else if (backend === 'postgres') out.index = await countOn(search.postgres)
+  else {
+    out.index = await countOn(search.elastic, { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) })
+    if (!(out.index as { ok: boolean }).ok && pgVerified) {
+      out.index = { ...(await countOn(search.postgres)), fallback: 'Elasticsearch did not answer; new sessions go to Postgres' }
+    }
   }
   return { ...out, ...(deps.health?.() ?? {}) }
+}
+
+async function countOn(backend: SearchBackend, opts?: CallOptions): Promise<Record<string, unknown>> {
+  try {
+    return { ok: true, backend: backend.name, events: await backend.count(opts) }
+  } catch {
+    return { ok: false, backend: backend.name }
+  }
 }
 
 /**

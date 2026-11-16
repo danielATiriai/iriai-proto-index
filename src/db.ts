@@ -3,7 +3,9 @@ import pg from 'pg'
 export type Db = pg.Pool
 
 export function connect(databaseUrl: string, log: (msg: string) => void = console.error): Db {
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 10 })
+  // iriai.search_writer marks this code's connections as ones that keep
+  // event_docs in step with index_state; see the trigger in MIGRATION.
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 10, options: '-c iriai.search_writer=1' })
   // A Postgres restart terminates idle clients and the pool emits 'error';
   // unheard, that would end the process. The pool replaces the client.
   pool.on('error', (err) => log(`postgres: idle client lost: ${err.message}`))
@@ -139,6 +141,24 @@ create table if not exists search_control (
   updated_at timestamptz not null default now()
 );
 insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes') on conflict do nothing;
+
+-- Code that changes index_state without writing event_docs (this service
+-- before search on Postgres, say after a revert) leaves event_docs stale. Any
+-- such change clears the first fill and verification, so the next start fills
+-- event_docs again and compares before Postgres may serve.
+create or replace function search_foreign_write() returns trigger language plpgsql as $fn$
+begin
+  if coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
+    update search_control
+      set first_fill_done = false, pg_verified = false, compared_at = null, updated_at = now(),
+          note = 'index_state was changed by code that does not write event_docs; filling again'
+      where id = 1 and (first_fill_done or pg_verified);
+  end if;
+  return null;
+end
+$fn$;
+create or replace trigger index_state_foreign_write after insert or update or delete on index_state
+  for each statement execute function search_foreign_write();
 `
 
 export async function migrate(db: Db): Promise<void> {

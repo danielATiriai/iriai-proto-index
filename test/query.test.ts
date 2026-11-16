@@ -113,6 +113,8 @@ describe(`query API on ${BACKEND}`, { skip: (!databaseUrl || !elasticUrl) && 'TE
 
   it('sorts by start time with undated events last, and filters by author and eventUri', async () => {
     assert.deepEqual((await q('sort=startsAt&limit=100')).keys, ['f', 'a', 'e', 'b', 'u', 'x', 'c', 'd'])
+    // A coordinate with start-time order, as the acceptance script asks.
+    assert.deepEqual((await q(`${PEACE_PLAZA}&sort=startsAt&limit=100`)).keys, ['f', 'a', 'e', 'b', 'u', 'x', 'c', 'd'])
     assert.deepEqual((await q(`author=${OTHER}`)).keys, ['d'])
     assert.deepEqual((await q(`eventUri=at://${STEWARD}/${EVENT}/3e${'b'.repeat(11)}`)).keys, ['b'])
   })

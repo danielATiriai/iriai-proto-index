@@ -114,8 +114,8 @@ export class ElasticBackend implements SearchBackend {
     await this.es.closePointInTime({ id: snapshot })
   }
 
-  async count(): Promise<number> {
-    return (await this.es.count({ index: this.index })).count
+  async count(opts: CallOptions = {}): Promise<number> {
+    return (await this.es.count({ index: this.index }, opts)).count
   }
 
   /** Every document in the index, for the verifying comparison; refreshes first so recent writes are seen. */

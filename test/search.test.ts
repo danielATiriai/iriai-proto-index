@@ -17,7 +17,14 @@ import { SearchControl, readControl } from '../src/search/control.js'
 import { PostgresBackend, searchPool } from '../src/search/postgres.js'
 import { SearchUpkeep, comparable } from '../src/search/verify.js'
 import { EVENT, SIDECAR, eventValue, geo, sidecarValue } from './fixtures.js'
+import pg from 'pg'
 import { databaseUrl, elasticUrl, freshDb, memoryElastic } from './support.js'
+
+const dbUrl = (name: string) => {
+  const url = new URL(databaseUrl!)
+  url.pathname = `/${name}`
+  return url.toString()
+}
 
 const AUTHOR = 'did:plc:ewvi7nxzyoun6zhxrhs64oiz'
 const uriOf = (n: number) => `at://${AUTHOR}/${SIDECAR}/3ks${String(n).padStart(10, '0')}`
@@ -292,6 +299,65 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     assert.equal((await ask(PARAMS, page.cursor, forced)).events.length, 2)
   })
 
+  it('gives the same answers from both backends for every combination of filters and sorts', async () => {
+    const points = ['', 'latitude=37.78&longitude=-122.43']
+    const radii = ['', 'radiusMeters=3000']
+    const boxes = ['', 'west=-122.5&south=37.7&east=-122.4&north=37.783']
+    const windows = ['', 'windowStart=2026-10-16T02:00:00Z', 'windowEnd=2026-10-16T01:00:00Z']
+    const authors = ['', `author=${AUTHOR}`]
+    const sorts = ['', 'sort=startsAt', 'sort=distance']
+    await setVerified(true)
+    let compared = 0
+    for (const pt of points)
+      for (const r of radii)
+        for (const b of boxes)
+          for (const w of windows)
+            for (const a of authors)
+              for (const s of sorts) {
+                const params = [pt, r, b, w, a, s, 'limit=100'].filter(Boolean).join('&')
+                let parsed
+                try {
+                  parsed = parseEventQuery(new URLSearchParams(params))
+                } catch {
+                  continue
+                }
+                const run = async (force: 'elastic' | 'postgres') =>
+                  (await queryEvents({ ...deps, search: { ...search, force } }, parsed)).events.map((e) => e.uri)
+                assert.deepEqual(await run('postgres'), await run('elastic'), params)
+                compared++
+              }
+    assert.ok(compared >= 90, `${compared} combinations`)
+  })
+
+  it('falls back without waiting for Elasticsearch to close a snapshot', async () => {
+    await setVerified(true)
+    const stuck = {
+      name: 'elastic',
+      openSnapshot: async () => 'pit',
+      page: async () => Promise.reject(new Error('search timed out')),
+      closeSnapshot: () => new Promise<void>(() => {}),
+    } as unknown as ElasticBackend
+    const started = Date.now()
+    const page = await ask(PARAMS, undefined, { ...deps, search: { ...search, elastic: stuck } })
+    assert.equal(page.events.length, 2)
+    assert.ok(Date.now() - started < 1000, 'answered from Postgres at once')
+  })
+
+  it('reports Postgres in health when Elasticsearch is down and Postgres serves in its place', async () => {
+    await setVerified(true)
+    const server = createQueryServer({ db, search: { ...search, elastic: deadElastic() }, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    try {
+      const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/xrpc/_health`)
+      const body = (await res.json()) as { index: { ok: boolean; backend: string; events: number } }
+      assert.equal(body.index.ok, true)
+      assert.equal(body.index.backend, 'postgres')
+      assert.equal(body.index.events, 5)
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
+
   it('reports the backend serving new sessions in health', async () => {
     await setVerified(true)
     const server = createQueryServer({ db, search: { ...search, force: 'postgres' }, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
@@ -376,6 +442,38 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await upkeep.run()
     row = await readControl(db)
     assert.equal(row.pgVerified, true, row.note ?? '')
+  })
+
+  it('fills again and compares again after code that does not write Postgres changed index_state', async () => {
+    const upkeep = new SearchUpkeep(db, projector, () => {})
+    await upkeep.run()
+    assert.equal((await readControl(db)).pgVerified, true)
+
+    // This service before the change (after a revert, say) edits an event:
+    // index_state and today's index move on, event_docs does not.
+    const s1 = `at://${AUTHOR}/${SIDECAR}/3ks1`
+    const edited = { ...(await projector.postgres.get(s1))!, eventCid: 'bafyedited' }
+    await projector.elastic.put(edited)
+    const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+    await old.connect()
+    await old.query(`update index_state set updated_at = now() where uri = $1`, [s1])
+    await old.end()
+    let row = await readControl(db)
+    assert.equal(row.pgVerified, false)
+    assert.equal(row.firstFillDone, false)
+
+    // This service's own writes do not trip it.
+    await setIndexState(db, s1, AUTHOR, true, null)
+    assert.equal((await readControl(db)).firstFillDone, false)
+    await upkeep.run()
+    row = await readControl(db)
+    assert.equal(row.firstFillDone, true)
+    // The refill reads the stored records, which never had the edit, so it differs from today's index until that is projected too.
+    assert.equal(row.pgVerified, false)
+    await projector.projectSidecar(s1)
+    await db.query('update search_control set compared_at = null')
+    await upkeep.run()
+    assert.equal((await readControl(db)).pgVerified, true)
   })
 
   it('ignores indexedAt and key order when comparing', () => {

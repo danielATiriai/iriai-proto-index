@@ -23,7 +23,7 @@ export interface SearchBackend {
   openSnapshot(opts?: CallOptions): Promise<string>
   page(snapshot: string, q: EventQuery, after: unknown[] | undefined, size: number, opts?: CallOptions): Promise<{ hits: Hit[]; snapshot: string }>
   closeSnapshot(snapshot: string): Promise<void>
-  count(): Promise<number>
+  count(opts?: CallOptions): Promise<number>
 }
 
 export interface CallOptions {
