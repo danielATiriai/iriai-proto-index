@@ -1,0 +1,42 @@
+== 10000 events
+ table and indexes: 14 MB, closed rows: 1100
+
+                  query_shape                  | p50_ms | p95_ms | rows_avg 
+-----------------------------------------------+--------+--------+----------
+ radius 2 km, by distance                      |    0.5 |    0.7 |      2.0
+ radius 10 km and a week, by distance          |    0.7 |    1.0 |      1.0
+ a week, by start                              |    1.1 |    1.2 |     51.0
+ a month, by start                             |    2.3 |    2.9 |     51.0
+ box and a month, by start                     |    0.8 |    0.9 |      6.6
+ everything by distance (default with a point) |    5.9 |    9.7 |     51.0
+ later page by start (keyset after day 20)     |    0.2 |    0.5 |     51.0
+(7 rows)
+
+== 100000 events
+ table and indexes: 133 MB, closed rows: 11000
+
+                  query_shape                  | p50_ms | p95_ms | rows_avg 
+-----------------------------------------------+--------+--------+----------
+ radius 2 km, by distance                      |    1.4 |    1.9 |     23.7
+ radius 10 km and a week, by distance          |    2.8 |    3.6 |      9.5
+ a week, by start                              |    3.5 |    3.9 |     51.0
+ a month, by start                             |   22.1 |   28.5 |     51.0
+ box and a month, by start                     |    2.1 |    2.5 |     51.0
+ everything by distance (default with a point) |   38.4 |   43.2 |     51.0
+ later page by start (keyset after day 20)     |    0.6 |    0.8 |     51.0
+(7 rows)
+
+== 1000000 events
+ table and indexes: 1332 MB, closed rows: 110000
+
+                  query_shape                  | p50_ms | p95_ms | rows_avg 
+-----------------------------------------------+--------+--------+----------
+ radius 2 km, by distance                      |   14.3 |   23.9 |     51.0
+ radius 10 km and a week, by distance          |   37.9 |   69.8 |     51.0
+ a week, by start                              |   64.8 |   78.6 |     51.0
+ a month, by start                             |  312.4 |  344.2 |     51.0
+ box and a month, by start                     |   32.8 |   48.9 |     51.0
+ everything by distance (default with a point) |  289.7 |  310.8 |     51.0
+ later page by start (keyset after day 20)     |    4.1 |    4.6 |     51.0
+(7 rows)
+
