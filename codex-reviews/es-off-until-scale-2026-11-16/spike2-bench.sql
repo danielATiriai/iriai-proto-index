@@ -1,3 +1,4 @@
+-- v3 (Nov 16, after Codex review): the timed query filters on length(doc::text), so every returned document is read and detoasted.
 -- v2: every query in the snapshot (D1 A) form: current-rows branch union closed-rows branch, at a snapshot 20 minutes ago so both branches matter.
 -- The full document (doc, about 1.1 KB) is fetched. Time windows use the range index through a materialized CTE.
 create or replace function bench3(shape text, runs int) returns table(query_shape text, p50_ms numeric, p95_ms numeric, rows_avg numeric) language plpgsql as $$
@@ -29,7 +30,7 @@ begin
       sql := format('select uri, doc from ((%s order by %s limit 51) union all (%s order by %s limit 51)) u order by %s limit 51', cur, ord, old, ord, ord);
     end if;
     t0 := clock_timestamp();
-    execute 'select count(*) from (select length(doc::text) from (' || sql || ') q) s' into r;
+    execute 'select count(*) from (' || sql || ') q where length(doc::text) > 0' into r;
     ms := ms || extract(epoch from clock_timestamp() - t0) * 1000;
     tot := tot + r;
   end loop;
