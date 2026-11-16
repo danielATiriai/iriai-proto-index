@@ -1,6 +1,6 @@
 # Event search on Postgres until scale: technical specification
 
-Draft v13, 2026-11-16 (v1 to v7 reviewed; v7 to v12 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
+Draft v14, 2026-11-16 (v1 to v7 reviewed; v7 to v13 also by Codex Astra the same day; the triages list every change). Repo: danielATiriai/iriai-proto-index, against main d9ab983. Thread "Move event search off Elasticsearch until scale". The packet of the same name is the plain-language version; Daniel approves the packet.
 
 ## 1. Goal and scope
 
@@ -13,7 +13,7 @@ Out of scope: text search (the index has none and adds none), a new Railway proj
 Read from src/query/search.ts, src/query/service.ts, src/index/elastic.ts and src/main.ts at d9ab983:
 
 - Filters, combined with AND: geo radius (`geo_distance`, arc), geo box (`geo_bounding_box`; antimeridian when west > east), time window (interval overlap, inclusive start, exclusive end; an event without an end is a point; `timeValid` false never matches a time filter), `author` (up to 25 DIDs), `eventUri`.
-- Sorts: distance (arc, meters, unresolved points last), `startsAt` (missing last), then sidecar AT-URI ascending by bytes; with no sort, AT-URI only.
+- Sorts: distance (arc, meters, unresolved points last), `startsAt` (missing last), then sidecar AT-URI ascending by bytes; with no sort, distance when a coordinate is given, else AT-URI only.
 - Paging: a point-in-time snapshot opened on the first page, `search_after`, sealed cursors (AES-256-GCM), idle limit 15 minutes, absolute limit 1 hour. Results that stopped being complete since the snapshot are dropped after a Postgres check (`incompleteAmong`).
 - `getEvent` reads the document by id, with no completeness check.
 - Start-up: both roles wait for Elasticsearch (`waitFor('Elasticsearch', ensureIndex)`, forever) before serving. Elasticsearch connection errors count as transient in the ingester, so it retries the event and holds its checkpoint for as long as they last. `/xrpc/_health` reports `index.ok` from an Elasticsearch count, and the acceptance script requires `index.ok === true`.
@@ -140,11 +140,11 @@ Cost of the rule: until Postgres is verified, Elasticsearch serves alone and beh
 
 ### 5.4 First fill and rebuild
 
-On first start after PR 1 deploys, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done; meanwhile today's index serves, as today. A managed index is built whenever Elasticsearch use begins with `es_current` clear, including at the PR 2 deploy while `SEARCH_ES` is still `on`: a fresh index `placeproto-events-<n>` (n a counter in `search_control`, raised per build) with today's mapping and `index.gc_deletes` 2 hours; every current row copied, 500 per bulk request, with external versions; then reconciled (6.4). An index is deleted only when no open session can reach it. A managed index is deleted when use ends, which waits for `elastic_cursors_until` (5.2), and a failed candidate at once, since no session used it. Today's index is kept until 61 minutes after the PR 2 deploy, then deleted. When use begins, any other leftover index (one Elasticsearch could not delete at the time) is deleted before the build. So, apart from the hour after PR 2 (today's index and one managed index), at most one index exists. While Elasticsearch is off none remains, except one it could not delete when use ended (an outage then), which stays on its volume until use next begins.
+On first start after PR 1 deploys, the ingester projects every sidecar in `index_state` into `event_docs` (9 today) and records that the first fill is done; meanwhile today's index serves, as today. A managed index is built whenever Elasticsearch use begins with `es_current` clear, including at the PR 2 deploy while `SEARCH_ES` is still `on`: a fresh index `placeproto-events-<n>` (n a counter in `search_control`, raised per build) with today's mapping and `index.gc_deletes` 2 hours; every current row copied, 500 per bulk request, with external versions; then reconciled (6.4). An index is deleted only when no open session can reach it. A managed index is deleted when use ends, which waits for `elastic_cursors_until` (5.2), and a failed candidate at once, since no session used it. Today's index is kept until 61 minutes after the PR 2 deploy, then deleted. When use begins, any other leftover index (one Elasticsearch could not delete at the time) is deleted before the build. So at most two indexes exist (today's and one managed index, in the hour after PR 2), otherwise at most one. Indexes Elasticsearch could not delete because it was down (at most those two) stay on its volume until use next begins; otherwise none remains while it is off.
 
 ## 6. The scale controller
 
-With D2 held, 6.2 to 6.4 are not built (6.1's stats and the weekly check of 6.4 are), D3 does not apply, and Elasticsearch's deployment is removed at rollout and comes back only by Daniel's sentences (7).
+With D2 held, the controller is not built: no thresholds (6.2), no automatic turning on and off (6.3) and no states (6.4). Still built, because builds and rollbacks need them: 6.1's stats, the build, reconcile, replay and verifying comparison of 6.4, and the weekly check. D3 does not apply, and Elasticsearch's deployment is removed at rollout and comes back only by Daniel's sentences (7).
 
 Runs in the ingester every 10 minutes, under a session advisory lock (7140016) taken and released on one dedicated client, so only one runs. State is one row in `search_control` (state, since, elastic_index, elastic_cursors_until, last_switch_on, failures, disabled, es_current, es_seen_at, first_fill_done, pg_verified, note); unconfirmed Elasticsearch writes are rows of `es_pending` (4.2). The query service reads it every 30 seconds for routing; the may-serve check of 5.2 is read fresh at each first page.
 
