@@ -5,6 +5,8 @@ import { readControl } from './control.js'
 
 const COMPARE_EVERY_MS = 60 * 60_000
 const LISTED = 5
+/** Held by the ingester running upkeep. */
+export const UPKEEP_LOCK = 7140016
 
 /**
  * The ingester's search upkeep for PR 1 (spec 4.2, 5.2, 5.4), run at start-up
@@ -22,7 +24,35 @@ export class SearchUpkeep {
     private now: () => number = Date.now,
   ) {}
 
+  /**
+   * One upkeep at a time across ingesters (two run while a deploy overlaps):
+   * a session lock on a dedicated connection; an ingester that does not get
+   * it skips this run.
+   */
   async run(): Promise<void> {
+    let client
+    try {
+      client = await this.db.connect()
+    } catch (err) {
+      this.log(`search upkeep: ${(err as Error).message}`)
+      return
+    }
+    try {
+      const got = (await client.query<{ ok: boolean }>('select pg_try_advisory_lock($1) as ok', [UPKEEP_LOCK])).rows[0].ok
+      if (!got) return
+      try {
+        await this.runLocked()
+      } finally {
+        await client.query('select pg_advisory_unlock($1)', [UPKEEP_LOCK]).catch(() => {})
+      }
+    } catch (err) {
+      this.log(`search upkeep: ${(err as Error).message}`)
+    } finally {
+      client.release()
+    }
+  }
+
+  private async runLocked(): Promise<void> {
     await this.projector.postgres.pruneClosed().catch((err) => this.log(`pruning closed search rows failed: ${(err as Error).message}`))
     let row
     try {
@@ -65,11 +95,12 @@ export class SearchUpkeep {
    * and content (not versions, and not indexedAt, which records when each
    * copy was written). The result is recorded only if the fill is done and
    * the generation has not moved since the comparison began: a pass sets
-   * pg_verified, and a failure clears it, whoever set it (another ingester
-   * during a deploy overlap, say).
+   * pg_verified and a comparison that finds a difference clears it; one that
+   * could not run changes nothing. Upkeep runs on one ingester at a time.
    */
   async compare(): Promise<{ ok: boolean; note: string }> {
     let ok = false
+    let ran = false
     let note: string
     const { generation } = await readControl(this.db)
     try {
@@ -77,6 +108,7 @@ export class SearchUpkeep {
       const missing = [...es.keys()].filter((uri) => !pg.has(uri))
       const extra = [...pg.keys()].filter((uri) => !es.has(uri))
       const differ = [...pg.keys()].filter((uri) => es.has(uri) && comparable(pg.get(uri)!) !== comparable(es.get(uri)!))
+      ran = true
       ok = missing.length === 0 && extra.length === 0 && differ.length === 0
       note = ok
         ? `matched today's index: ${pg.size} documents`
@@ -93,9 +125,9 @@ export class SearchUpkeep {
       note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying in an hour'
     }
     const res = await this.db.query(
-      `update search_control set pg_verified = $1, compared_at = now(), note = $2, updated_at = now()
+      `update search_control set pg_verified = case when $4 then $1 else pg_verified end, compared_at = now(), note = $2, updated_at = now()
        where id = 1 and generation = $3 and first_fill_done`,
-      [ok, note, generation],
+      [ok, note, generation, ran],
     )
     if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }
     return { ok, note }

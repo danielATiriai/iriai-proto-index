@@ -494,16 +494,15 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     }
   })
 
-  it('reports new sessions as not served in health when search_control answers too slowly, Elasticsearch chosen', async () => {
+  it('reports new sessions as not served in health when search_control answers too slowly and no cover is cached, Elasticsearch chosen', async () => {
     const slow = { ...search, control: slowControl(650) }
     await assert.rejects(ask(PARAMS, undefined, { ...deps, search: slow }), unavailable)
     const server = createQueryServer({ db, search: slow, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
     try {
       const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/xrpc/_health`)
-      const body = (await res.json()) as { index: { ok: boolean }; getEvent: { ok: boolean; backend: string } }
+      const body = (await res.json()) as { index: { ok: boolean } }
       assert.equal(body.index.ok, false)
-      assert.deepEqual({ ok: body.getEvent.ok, backend: body.getEvent.backend }, { ok: true, backend: 'elastic' })
     } finally {
       await new Promise<void>((r) => server.close(() => r()))
     }
@@ -531,6 +530,62 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
       await holder.query('rollback').catch(() => {})
       await holder.end()
       await pool.end()
+    }
+  })
+
+  /** Health's index, from a server on `s`. */
+  const healthIndex = async (s: Search) => {
+    const server = createQueryServer({ db, search: s, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    try {
+      const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/xrpc/_health`)
+      return ((await res.json()) as { index: { ok: boolean; backend?: string } }).index
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  }
+
+  it('agrees with a first page in health when a cached cover lets Elasticsearch serve while search_control fails', async () => {
+    const control = new SearchControl(db)
+    await control.coverElasticSession()
+    // From now on every read fails; the cached cover still holds.
+    control.refresh = async () => Promise.reject(new Error('down'))
+    const s = { ...search, control }
+    const page = await ask(PARAMS, undefined, { ...deps, search: s })
+    assert.ok(page.events.length > 0)
+    const index = await healthIndex(s)
+    assert.equal(index.ok, true)
+    assert.equal(index.backend, 'elastic')
+  })
+
+  it('agrees with a first page in health when verification is cleared during a failing Elasticsearch attempt', async () => {
+    await setVerified(true)
+    const clearing = {
+      name: 'elastic',
+      count: async () => {
+        await db.query('update search_control set pg_verified = false')
+        throw new Error('connect ECONNREFUSED')
+      },
+    } as unknown as ElasticBackend
+    const index = await healthIndex({ ...search, elastic: clearing })
+    assert.equal(index.ok, false)
+    await setVerified(true)
+  })
+
+  it('migrates again while a projection holds event_docs and then reads accounts, without a deadlock', async () => {
+    const a = new pg.Client({ connectionString: dbUrl('routing_test') })
+    await a.connect()
+    try {
+      await a.query('begin')
+      await a.query('update event_docs set closed_at = closed_at where false')
+      const migrating = migrate(db)
+      await new Promise((r) => setTimeout(r, 300))
+      await a.query('select active from accounts limit 1')
+      await a.query('commit')
+      await migrating
+    } finally {
+      await a.query('rollback').catch(() => {})
+      await a.end()
     }
   })
 
@@ -796,7 +851,38 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     assert.equal(await projector.postgres.get(s3), undefined)
   })
 
-  it('clears verification when a comparison fails, whoever set it', async () => {
+  it('runs upkeep on one ingester at a time', async () => {
+    const holder = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+    await holder.connect()
+    try {
+      await holder.query('select pg_advisory_lock($1)', [7140016])
+      await db.query('update search_control set pg_verified = false, compared_at = null')
+      let compared = false
+      const upkeep = new SearchUpkeep(db, projector, () => {})
+      upkeep.compare = async () => ((compared = true), { ok: true, note: '' })
+      await upkeep.run()
+      assert.equal(compared, false, 'ran while another ingester held upkeep')
+    } finally {
+      await holder.end()
+    }
+    await new SearchUpkeep(db, projector, () => {}).run()
+    assert.equal((await readControl(db)).pgVerified, true)
+  })
+
+  it('leaves verification as it is when a comparison cannot run', async () => {
+    await db.query('update search_control set pg_verified = true, first_fill_done = true')
+    const real = projector.elastic.allDocs.bind(projector.elastic)
+    projector.elastic.allDocs = async () => Promise.reject(new Error('connect ECONNREFUSED'))
+    try {
+      const res = await new SearchUpkeep(db, projector, () => {}).compare()
+      assert.equal(res.ok, false)
+      assert.equal((await readControl(db)).pgVerified, true)
+    } finally {
+      projector.elastic.allDocs = real
+    }
+  })
+
+  it('clears verification when a comparison finds a difference, whoever set it', async () => {
     await db.query('update search_control set pg_verified = true, first_fill_done = true, compared_at = null')
     const upkeep = new SearchUpkeep(db, projector, () => {})
     const extra = { ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks1`))!, uri: `at://${AUTHOR}/${SIDECAR}/3ksextra` }

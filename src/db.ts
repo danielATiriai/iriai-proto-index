@@ -44,7 +44,15 @@ create table if not exists accounts (
 );
 -- Set when an account goes inactive; its events stay out of search until a
 -- rebuild from its PDS succeeds after it returns (PlaceProto §4).
-alter table accounts add column if not exists needs_rebuild boolean not null default false;
+-- Only when missing: ALTER TABLE locks accounts exclusively even when the
+-- column exists, on every start, while ingestion may be running.
+do $do$
+begin
+  if not exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'accounts' and column_name = 'needs_rebuild') then
+    alter table accounts add column needs_rebuild boolean not null default false;
+  end if;
+end
+$do$;
 
 create table if not exists index_state (
   uri text primary key,
@@ -165,11 +173,13 @@ end
 $fn$;
 -- Created only when missing: replacing a trigger locks its table, and an
 -- older writer already inside the trigger (waiting on search_control) would
--- then deadlock with this script.
+-- then deadlock with this script. Tables are taken in the order the
+-- ingester writes them (records, accounts, index_state), as everywhere in
+-- this script.
 do $do$
 declare t text;
 begin
-  foreach t in array array['index_state', 'records', 'accounts', 'checkpoints', 'skipped_events'] loop
+  foreach t in array array['records', 'accounts', 'index_state', 'checkpoints', 'skipped_events'] loop
     if not exists (select 1 from pg_trigger where tgname = t || '_foreign_write' and tgrelid = t::regclass) then
       execute format('create trigger %I after insert or update or delete on %I for each statement execute function search_foreign_write()', t || '_foreign_write', t);
     end if;

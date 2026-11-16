@@ -8,8 +8,7 @@ import { readCheckpoint } from '../ingest/store.js'
 import { CursorError } from './cursor.js'
 import { Limits } from './limits.js'
 import { InvalidRequest, parseEventQuery } from './params.js'
-import type { CallOptions, SearchBackend } from '../search/backend.js'
-import { ELASTIC_FIRST_MS, XrpcError, getEvent, queryEvents, type QueryDeps, type Search } from './service.js'
+import { XrpcError, getEvent, probeNewSession, queryEvents, type QueryDeps, type Search } from './service.js'
 
 const contracts = JSON.parse(readFileSync(`${contractsRoot}SOURCE.json`, 'utf8')) as { tag: string; sha256: string }
 const ACCESS = 'Interim: open access with no key and per-caller rate limits (D-14). A project key and higher limits come with MVP.'
@@ -109,19 +108,14 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   } catch {
     out.database = 'unavailable'
   }
-  // index: the backend new sessions go to, by the rule of spec 5.2; search:
-  // the state behind that choice (spec 5.3, as PR 1 has it).
+  // index: what a new session gets right now, by running a first page's own
+  // routing steps (spec 5.2, 5.3); search: the state behind that choice.
   const { search } = deps
-  let backend: string | undefined
-  let pgVerified = false
   try {
     const row = await search.control.refresh()
-    const chosen = route(search.force, row)
-    backend = chosen?.backend
-    pgVerified = row.pgVerified
     out.search = {
       force: search.force,
-      chosen: chosen ?? null,
+      chosen: route(search.force, row) ?? null,
       lastServed: search.last ?? null,
       esInUse: true,
       pgFirstFillDone: row.firstFillDone,
@@ -131,36 +125,10 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
       elasticCursorsUntil: row.elasticCursorsUntil.toISOString(),
     }
   } catch {
-    // Unreadable search_control: no new session can be served (a verified
-    // Postgres cannot be shown, and an Elasticsearch session cannot be
-    // covered), so index is not ok. getEvent still routes as unverified, so
-    // health reports the backend that would answer it.
     out.search = { unavailable: true }
-    out.index = { ok: false, reason: 'search_control unavailable: new sessions are refused' }
-    const forGet = route(search.force, { pgVerified: false })?.backend
-    out.getEvent = forGet === 'elastic' ? await countOn(search.elastic) : { ok: false }
-    return { ...out, ...(deps.health?.() ?? {}) }
   }
-  // Elasticsearch not answering within 2 seconds hands new sessions to a
-  // verified Postgres, so health reports Postgres then, as routing does.
-  if (!backend) out.index = { ok: false }
-  else if (backend === 'postgres') out.index = await countOn(search.postgres)
-  else {
-    // The 2-second limit applies only once Postgres is verified, as in routing.
-    out.index = await countOn(search.elastic, pgVerified ? { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) } : {})
-    if (!(out.index as { ok: boolean }).ok && pgVerified) {
-      out.index = { ...(await countOn(search.postgres)), fallback: 'Elasticsearch did not answer; new sessions go to Postgres' }
-    }
-  }
+  out.index = await probeNewSession(search)
   return { ...out, ...(deps.health?.() ?? {}) }
-}
-
-async function countOn(backend: SearchBackend, opts?: CallOptions): Promise<Record<string, unknown>> {
-  try {
-    return { ok: true, backend: backend.name, events: await backend.count(opts) }
-  } catch {
-    return { ok: false, backend: backend.name }
-  }
 }
 
 /**

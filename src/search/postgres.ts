@@ -52,10 +52,17 @@ export class PostgresBackend implements SearchBackend {
    */
   async project<T extends { doc?: EventDoc }>(uri: string, assemble: (q: Db) => Promise<T>): Promise<T> {
     let out: T | undefined
-    await this.write(uri, async (client, version) => {
-      out = await assemble(client as unknown as Db)
-      if (out.doc) await insertDoc(client, version, out.doc)
-    })
+    await this.write(
+      uri,
+      async (client, version) => {
+        if (out!.doc) await insertDoc(client, version, out!.doc)
+      },
+      // Read before event_docs is touched, so the transaction locks tables in
+      // the migration's order (records, accounts, then event_docs).
+      async (client) => {
+        out = await assemble(client as unknown as Db)
+      },
+    )
     return out!
   }
 
@@ -74,11 +81,16 @@ export class PostgresBackend implements SearchBackend {
    * before the lock could be lower than a snapshot read in between), then the
    * current row is closed with it and `insert` adds the new one.
    */
-  private async write(uri: string, insert: (client: pg.PoolClient, version: string) => Promise<void>): Promise<bigint> {
+  private async write(
+    uri: string,
+    insert: (client: pg.PoolClient, version: string) => Promise<void>,
+    prepare?: (client: pg.PoolClient) => Promise<void>,
+  ): Promise<bigint> {
     const client = await this.db.connect()
     try {
       await client.query('begin')
       await client.query('select pg_advisory_xact_lock($1)', [WRITE_LOCK])
+      await prepare?.(client)
       const version = (await client.query<{ v: string }>(`select nextval('event_doc_version')::text as v`)).rows[0].v
       await client.query(
         `update event_docs set closed_version = $2, closed_at = clock_timestamp()
