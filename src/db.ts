@@ -72,6 +72,73 @@ create table if not exists skipped_events (
   attempts integer not null,
   skipped_at timestamptz not null default now()
 );
+
+-- Search on Postgres (proposal "Search without Elasticsearch" v14, build
+-- 5e80472; spec 4.1). One row per version of each complete event: the
+-- current row has closed_version null; a replaced or removed row keeps the
+-- number of the write that closed it, so a paging session sees the data as of
+-- its snapshot number, and is deleted 61 minutes after closing.
+create sequence if not exists event_doc_version;
+create table if not exists event_docs (
+  uri text collate "C" not null,
+  version bigint not null,
+  did text not null,
+  event_uri text not null,
+  doc jsonb not null,
+  lat double precision,
+  lon double precision,
+  starts_at timestamptz,
+  ends_at timestamptz,
+  time_valid boolean not null,
+  closed_version bigint,
+  closed_at timestamptz
+);
+
+-- [s, s] for an event without an end, [s, e) when it ends after it starts,
+-- otherwise null: the time-window semantics of the Elasticsearch filter.
+create or replace function event_span(s timestamptz, e timestamptz) returns tstzrange
+  language sql immutable parallel safe as $fn$
+  select case
+    when s is null then null
+    when e is null then tstzrange(s, s, '[]')
+    when e > s then tstzrange(s, e, '[)')
+    else null
+  end
+$fn$;
+
+-- Haversine meters on the mean radius Elasticsearch uses. Strict, so an
+-- unresolved point gives null and sorts last.
+create or replace function arc_m(lat1 double precision, lon1 double precision, lat2 double precision, lon2 double precision)
+  returns double precision language sql immutable strict parallel safe as $fn$
+  select 2 * 6371008.7714 * asin(least(1, sqrt(
+    power(sin(radians(lat2 - lat1) / 2), 2)
+    + cos(radians(lat1)) * cos(radians(lat2)) * power(sin(radians(lon2 - lon1) / 2), 2)
+  )))
+$fn$;
+
+create unique index if not exists event_docs_current_uri on event_docs (uri) where closed_version is null;
+create index if not exists event_docs_current_start on event_docs (starts_at, uri) where closed_version is null;
+create index if not exists event_docs_current_point on event_docs (lat, lon) where closed_version is null and lat is not null;
+create index if not exists event_docs_current_span on event_docs using gist (event_span(starts_at, ends_at)) where closed_version is null;
+create index if not exists event_docs_current_did on event_docs (did) where closed_version is null;
+create index if not exists event_docs_current_event on event_docs (event_uri) where closed_version is null;
+create index if not exists event_docs_closed_point on event_docs (lat, lon) where closed_version is not null and lat is not null;
+create index if not exists event_docs_closed_span on event_docs using gist (event_span(starts_at, ends_at)) where closed_version is not null;
+create index if not exists event_docs_closed_at on event_docs (closed_at) where closed_version is not null;
+
+-- Search routing state, one row (spec 6; PR 2 adds the controller's columns).
+-- elastic_cursors_until: Elasticsearch cursors are honored until then; the
+-- first migration covers cursors issued before it.
+create table if not exists search_control (
+  id integer primary key check (id = 1),
+  elastic_cursors_until timestamptz not null,
+  first_fill_done boolean not null default false,
+  pg_verified boolean not null default false,
+  compared_at timestamptz,
+  note text,
+  updated_at timestamptz not null default now()
+);
+insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes') on conflict do nothing;
 `
 
 export async function migrate(db: Db): Promise<void> {

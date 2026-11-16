@@ -94,7 +94,7 @@ if (first) {
 
 const health = await json(`${BASE}/xrpc/_health`)
 console.log(`\nHealth: ${JSON.stringify(health)}`)
-check(health.index?.ok === true, 'index reachable')
+check(health.index?.ok === true, `index reachable (backend: ${health.index?.backend ?? 'not reported'})`)
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nAll checks passed')
 process.exit(failures ? 1 : 0)

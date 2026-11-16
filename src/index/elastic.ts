@@ -1,4 +1,7 @@
 import { Client, errors } from '@elastic/elasticsearch'
+import type { EventQuery } from '../query/params.js'
+import { buildSearch } from '../query/search.js'
+import type { CallOptions, Hit, SearchBackend } from '../search/backend.js'
 import type { EventDoc } from './assemble.js'
 
 export type Elastic = Client
@@ -47,4 +50,91 @@ export async function removeDoc(es: Elastic, index: string, uri: string): Promis
 export async function getDoc(es: Elastic, index: string, uri: string): Promise<EventDoc | undefined> {
   const res = await es.get<EventDoc>({ index, id: uri }, { ignore: [404] })
   return res.found ? res._source : undefined
+}
+
+const KEEP_ALIVE = '15m'
+
+/**
+ * Today's Elasticsearch index behind the search interface (spec 3). Writes
+ * use Elasticsearch's own versions, exactly as before (spec 5.1, PR 1). The
+ * index is created on the first write rather than at start-up, so neither role
+ * waits for Elasticsearch to start (spec 5.2).
+ */
+export class ElasticBackend implements SearchBackend {
+  readonly name = 'elastic' as const
+  private ensured = false
+
+  constructor(
+    readonly es: Elastic,
+    readonly index: string,
+  ) {}
+
+  private async ensure(): Promise<void> {
+    if (this.ensured) return
+    await ensureIndex(this.es, this.index)
+    this.ensured = true
+  }
+
+  async put(doc: EventDoc): Promise<void> {
+    await this.ensure()
+    await putDoc(this.es, this.index, doc)
+  }
+
+  async remove(uri: string): Promise<void> {
+    await this.ensure()
+    await removeDoc(this.es, this.index, uri)
+  }
+
+  async get(uri: string, opts: CallOptions = {}): Promise<EventDoc | undefined> {
+    const res = await this.es.get<EventDoc>({ index: this.index, id: uri }, { ignore: [404], ...opts })
+    return res.found ? res._source : undefined
+  }
+
+  async openSnapshot(opts: CallOptions = {}): Promise<string> {
+    return (await this.es.openPointInTime({ index: this.index, keep_alive: KEEP_ALIVE }, opts)).id
+  }
+
+  async page(snapshot: string, q: EventQuery, after: unknown[] | undefined, size: number, opts: CallOptions = {}): Promise<{ hits: Hit[]; snapshot: string }> {
+    const { query, sort } = buildSearch(q)
+    const res = await this.es.search<EventDoc>(
+      {
+        pit: { id: snapshot, keep_alive: KEEP_ALIVE },
+        query,
+        sort: sort as never,
+        size,
+        ...(after ? { search_after: after as never } : {}),
+        track_total_hits: false,
+      },
+      opts,
+    )
+    return { hits: res.hits.hits.map((h) => ({ doc: h._source!, sort: h.sort ?? [] })), snapshot: res.pit_id ?? snapshot }
+  }
+
+  async closeSnapshot(snapshot: string): Promise<void> {
+    await this.es.closePointInTime({ id: snapshot })
+  }
+
+  async count(): Promise<number> {
+    return (await this.es.count({ index: this.index })).count
+  }
+
+  /** Every document in the index, for the verifying comparison; refreshes first so recent writes are seen. */
+  async allDocs(): Promise<Map<string, EventDoc>> {
+    await this.es.indices.refresh({ index: this.index })
+    const out = new Map<string, EventDoc>()
+    let after: unknown[] | undefined
+    for (;;) {
+      const res = await this.es.search<EventDoc>({
+        index: this.index,
+        size: 1000,
+        sort: [{ uri: { order: 'asc' } }] as never,
+        ...(after ? { search_after: after as never } : {}),
+        track_total_hits: false,
+      })
+      const hits = res.hits.hits
+      for (const h of hits) out.set(h._id!, h._source!)
+      if (hits.length < 1000) return out
+      after = hits[hits.length - 1].sort
+    }
+  }
 }

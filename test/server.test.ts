@@ -13,8 +13,7 @@ describe('query server', () => {
     // Requests here fail validation before reaching Postgres or Elasticsearch.
     server = createQueryServer({
       db: undefined as never,
-      es: undefined as never,
-      index: 'events',
+      search: undefined as never,
       serviceId: 'test',
       cursorKey: randomBytes(32),
       rateLimitPerMinute: 1,

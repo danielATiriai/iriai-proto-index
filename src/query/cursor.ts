@@ -9,7 +9,9 @@ export interface CursorState {
   svc: string
   /** Hash of the normalized filters, coordinate and sort. */
   bind: string
-  /** Elasticsearch point-in-time id: the session's snapshot. */
+  /** The backend that opened the session; absent on cursors issued before it existed, which are Elasticsearch's. */
+  be?: 'postgres' | 'elastic'
+  /** The session's snapshot: an Elasticsearch point-in-time id, or a Postgres snapshot number. */
   pit: string
   /** Sort values of the last examined candidate. */
   after: unknown[]

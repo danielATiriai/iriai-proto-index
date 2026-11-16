@@ -2,21 +2,20 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync } from 'node:fs'
 import { config, contractsRoot } from '../contracts/contracts.js'
 import type { Db } from '../db.js'
-import type { Elastic } from '../index/elastic.js'
+import { route } from '../search/control.js'
 import { CHECKPOINT } from '../ingest/ingester.js'
 import { readCheckpoint } from '../ingest/store.js'
 import { CursorError } from './cursor.js'
 import { Limits } from './limits.js'
 import { InvalidRequest, parseEventQuery } from './params.js'
-import { XrpcError, getEvent, queryEvents, type QueryDeps } from './service.js'
+import { XrpcError, getEvent, queryEvents, type QueryDeps, type Search } from './service.js'
 
 const contracts = JSON.parse(readFileSync(`${contractsRoot}SOURCE.json`, 'utf8')) as { tag: string; sha256: string }
 const ACCESS = 'Interim: open access with no key and per-caller rate limits (D-14). A project key and higher limits come with MVP.'
 
 export interface ServerDeps {
   db: Db
-  es: Elastic
-  index: string
+  search: Search
   serviceId: string
   cursorKey: Buffer
   rateLimitPerMinute: number
@@ -109,11 +108,33 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   } catch {
     out.database = 'unavailable'
   }
+  // index: the backend new sessions go to, by the rule of spec 5.2; search:
+  // the state behind that choice (spec 5.3, as PR 1 has it).
+  const { search } = deps
+  let backend: string | undefined
   try {
-    const count = await deps.es.count({ index: deps.index })
-    out.index = { ok: true, events: count.count }
+    const row = await search.control.refresh()
+    const chosen = route(search.force, row)
+    backend = chosen?.backend
+    out.search = {
+      force: search.force,
+      chosen: chosen ?? null,
+      lastServed: search.last ?? null,
+      esInUse: true,
+      pgFirstFillDone: row.firstFillDone,
+      pgVerified: row.pgVerified,
+      comparedAt: row.comparedAt?.toISOString() ?? null,
+      comparison: row.note,
+      elasticCursorsUntil: row.elasticCursorsUntil.toISOString(),
+    }
   } catch {
-    out.index = { ok: false }
+    out.search = { unavailable: true }
+  }
+  try {
+    if (!backend) throw new Error('no backend may serve')
+    out.index = { ok: true, backend, events: await (backend === 'postgres' ? search.postgres : search.elastic).count() }
+  } catch {
+    out.index = { ok: false, ...(backend ? { backend } : {}) }
   }
   return { ...out, ...(deps.health?.() ?? {}) }
 }

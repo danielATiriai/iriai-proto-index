@@ -21,12 +21,16 @@ export interface Settings {
   cursorKey: Buffer
   rateLimitPerMinute: number
   pagingSessionsPerHour: number
+  /** SEARCH_BACKEND_FORCE: the backend new sessions are routed to when it may serve (spec 5.2); elastic unless set. */
+  searchBackendForce: 'elastic' | 'postgres'
 }
 
 export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
   const role = (env.ROLE ?? 'all') as Role
   if (!['ingester', 'query', 'all'].includes(role)) throw new Error(`ROLE must be ingester, query or all, not ${role}`)
   const needsCursorKey = role !== 'ingester'
+  const force = env.SEARCH_BACKEND_FORCE || 'elastic'
+  if (force !== 'elastic' && force !== 'postgres') throw new Error(`SEARCH_BACKEND_FORCE must be elastic or postgres, not ${force}`)
   const cursorKey = Buffer.from(env.CURSOR_KEY ?? '', 'base64')
   if (needsCursorKey && cursorKey.length !== 32) throw new Error('CURSOR_KEY must be 32 bytes, base64-encoded')
   return {
@@ -43,6 +47,7 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
     cursorKey,
     rateLimitPerMinute: Number(env.RATE_LIMIT_PER_MINUTE ?? 120),
     pagingSessionsPerHour: Number(env.PAGING_SESSIONS_PER_HOUR ?? 60),
+    searchBackendForce: force,
   }
 }
 

@@ -37,6 +37,14 @@ export function memoryElastic(): Elastic & { docs: Map<string, unknown>; down: b
       docs.delete(id)
     },
     get: async ({ id }: { id: string }) => (docs.has(id) ? { found: true, _source: docs.get(id) } : { found: false }),
+    indices: {
+      exists: async () => {
+        if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
+        return true
+      },
+      refresh: async () => {},
+    },
+    search: async () => ({ hits: { hits: [...docs].map(([id, doc]) => ({ _id: id, _source: doc })) } }),
   }
   return es as never
 }

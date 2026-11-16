@@ -38,8 +38,9 @@ Iriai runs no stream of its own in YC (D-13). To follow PlaceProto events as the
   - A failed event closes the connection and is replayed on reconnect, with backoff up to 30 s. Postgres, Elasticsearch and network outages are retried for as long as they last. An event that fails three times for any other reason is skipped and recorded in `skipped_events`.
   - The ingester's `/health` answers 503 once Jetstream has been disconnected for a minute.
   - Locations resolve locally: geo coordinates, and H3 cell centres.
-- **Query** (`ROLE=query`) serves the API from Elasticsearch (`search_after` over a point in time). It checks PostgreSQL to suppress results that stopped being complete. Rate limits are per caller, by the `X-Real-IP` address Railway's edge sets. `query.iriai.app` stays DNS-only on Cloudflare, since proxying it would make every caller a Cloudflare address. A paging session counts against the hourly limit only when an answer returns a cursor.
-- **Health** (`/xrpc/_health`) reports ingestion lag, sidecar counts by state, inactive accounts and accounts awaiting a rebuild, skipped events, and the index size.
+- **Search on Postgres** (proposal "Search without Elasticsearch" v14, build 5e80472, PR 1 of 2). Every index change goes to Postgres's `event_docs` first and then to today's Elasticsearch index exactly as before. On its first start the ingester fills `event_docs` from `index_state`, then compares it with today's index by document id and content, hourly until it matches once; health shows the result (`search.pgVerified`). Neither role waits for Elasticsearch at start-up.
+- **Query** (`ROLE=query`) serves the API from Elasticsearch (`search_after` over a point in time) unless `SEARCH_BACKEND_FORCE=postgres`, which moves new sessions to Postgres once it is verified. If Elasticsearch fails a first page or a `getEvent` within 2 seconds, a verified Postgres answers instead; otherwise the answer is `ServiceUnavailable`. A cursor stays on the backend that opened its session. It checks PostgreSQL to suppress results that stopped being complete. Rate limits are per caller, by the `X-Real-IP` address Railway's edge sets. `query.iriai.app` stays DNS-only on Cloudflare, since proxying it would make every caller a Cloudflare address. A paging session counts against the hourly limit only when an answer returns a cursor.
+- **Health** (`/xrpc/_health`) reports ingestion lag, sidecar counts by state, inactive accounts and accounts awaiting a rebuild, skipped events, the backend serving new sessions with its size (`index`), and the search state behind that choice (`search`).
 
 ## Configuration
 
@@ -54,6 +55,7 @@ Iriai runs no stream of its own in YC (D-13). To follow PlaceProto events as the
 | `APPROVED_ACCOUNTS` | ingester | the steward, `did:plc:kd5s7zyp7nje43ievnqhgzrr` |
 | `RATE_LIMIT_PER_MINUTE`, `PAGING_SESSIONS_PER_HOUR` | query | 120, 60 |
 | `SERVICE_ID` | query | `query.iriai.app` |
+| `SEARCH_BACKEND_FORCE` | query | `elastic`; `postgres` serves new sessions from Postgres once verified |
 
 ## Development
 

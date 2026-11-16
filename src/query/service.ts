@@ -3,11 +3,11 @@ import { AtUri, isValidDid } from '@atproto/syntax'
 import type { Db } from '../db.js'
 import { eventSidecarNsid } from '../contracts/contracts.js'
 import type { EventDoc } from '../index/assemble.js'
-import { getDoc, type Elastic } from '../index/elastic.js'
 import { getRecord, incompleteAmong } from '../ingest/store.js'
 import { CursorError, bindingHash, decodeCursor, encodeCursor } from './cursor.js'
 import { InvalidRequest, bindingOf, type EventQuery } from './params.js'
-import { buildSearch } from './search.js'
+import type { BackendName, CallOptions, Hit, SearchBackend } from '../search/backend.js'
+import { route, type Route, type SearchControl } from '../search/control.js'
 
 export class XrpcError extends Error {
   constructor(
@@ -30,18 +30,54 @@ export interface EventView {
 
 export interface QueryDeps {
   db: Db
-  es: Elastic
-  index: string
+  search: Search
   serviceId: string
   cursorKey: Buffer
   /** Paging-session limit for this caller: `wait` before a first page, `opened` when it returns a cursor. */
   sessions?: { wait: () => number; opened: () => void }
 }
 
-const KEEP_ALIVE = '15m'
+/** Both backends and what routes between them (spec 5.2). */
+export interface Search {
+  elastic: SearchBackend
+  postgres: SearchBackend
+  control: SearchControl
+  /** SEARCH_BACKEND_FORCE; elastic unless set. */
+  force: BackendName
+  /** The last backend chosen for a new session or getEvent, and why, for health. */
+  last?: Route & { at: string }
+}
+
+/** An Elasticsearch first page (or getEvent) that has not answered in this long falls back (spec 5.2). */
+export const ELASTIC_FIRST_MS = 2_000
 
 function view(doc: EventDoc): EventView {
   return { ...doc.view, version: { eventCid: doc.eventCid, sidecarCid: doc.sidecarCid } }
+}
+
+/**
+ * Routes a new session or a getEvent: the chosen backend if it may serve,
+ * else Postgres if verified, else ServiceUnavailable. Elasticsearch failing
+ * within 2 seconds counts as not serving, so Postgres takes the request if it
+ * is verified.
+ */
+async function routed<T>(search: Search, run: (backend: SearchBackend, opts: CallOptions) => Promise<T>): Promise<T> {
+  const row = await unavailableOnFailure(() => search.control.current())
+  const chosen = route(search.force, row)
+  if (!chosen) throw new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable: Postgres is not verified yet')
+  if (chosen.backend === 'postgres') {
+    search.last = { ...chosen, at: new Date().toISOString() }
+    return unavailableOnFailure(() => run(search.postgres, {}))
+  }
+  try {
+    const result = await run(search.elastic, { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) })
+    search.last = { ...chosen, at: new Date().toISOString() }
+    return result
+  } catch (err) {
+    if (!row.pgVerified) throw toUnavailable(err)
+    search.last = { backend: 'postgres', reason: `Elasticsearch failed (${(err as Error).message}); Postgres verified`, at: new Date().toISOString() }
+    return unavailableOnFailure(() => run(search.postgres, {}))
+  }
 }
 
 /** app.iriai.proto.getEvent: one complete event by its sidecar AT-URI. */
@@ -56,7 +92,7 @@ export async function getEvent(deps: QueryDeps, uriParam: string | null): Promis
   if (!isValidDid(uri.host)) throw new InvalidRequest('uri must use a DID, not a handle')
   if (uri.collection !== eventSidecarNsid || !uri.rkey) throw new InvalidRequest(`uri must name a ${eventSidecarNsid} record`)
 
-  const doc = await unavailableOnFailure(() => getDoc(deps.es, deps.index, uri.toString()))
+  const doc = await routed(deps.search, (backend, opts) => backend.get(uri.toString(), opts))
   if (doc) {
     const v = view(doc)
     return { value: v, version: v.version }
@@ -67,71 +103,73 @@ export async function getEvent(deps: QueryDeps, uriParam: string | null): Promis
 }
 
 /**
- * app.iriai.proto.queryEvents. The first page opens a point-in-time snapshot;
- * each cursor carries it with the sort values of the last examined candidate,
- * so new records and edits appear only in a fresh query. Candidates that
- * stopped being complete since the snapshot (deleted, orphaned, suppressed)
- * are dropped, and the cursor still moves past them, so a page can be short
- * or empty while a cursor is returned.
+ * app.iriai.proto.queryEvents. The first page opens a snapshot on the backend
+ * the session is routed to; each cursor carries that backend, the snapshot
+ * and the sort values of the last examined candidate, so new records and
+ * edits appear only in a fresh query. Candidates that stopped being complete
+ * since the snapshot (deleted, orphaned, suppressed) are dropped, and the
+ * cursor still moves past them, so a page can be short or empty while a
+ * cursor is returned.
  */
 export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now()): Promise<{ events: EventView[]; cursor?: string }> {
   const expect = { svc: deps.serviceId, bind: bindingHash(bindingOf(q)) }
-  let pit: string
-  let after: unknown[] | undefined
+  const { search } = deps
+  let backend: SearchBackend
   let created: number
+  let hits: Hit[]
+  let snapshot: string
+
   if (q.cursor) {
     const state = decodeCursor(q.cursor, deps.cursorKey, expect, now)
-    pit = state.pit
-    after = state.after
+    // Cursors from before the backend field are Elasticsearch's.
+    backend = (state.be ?? 'elastic') === 'postgres' ? search.postgres : search.elastic
     created = state.created
+    if (backend.name === 'elastic' && !(await unavailableOnFailure(() => search.control.elasticCursorsOpen()))) {
+      throw new CursorError('CursorExpired', 'the paging snapshot has expired; restart without a cursor')
+    }
+    try {
+      ;({ hits, snapshot } = await backend.page(state.pit, q, state.after, q.limit + 1))
+    } catch (err) {
+      if (isMissingSnapshot(err)) throw new CursorError('CursorExpired', 'the paging snapshot has expired; restart without a cursor')
+      throw toUnavailable(err)
+    }
   } else {
     const wait = deps.sessions?.wait() ?? 0
     if (wait > 0) throw new XrpcError(429, 'RateLimitExceeded', 'too many paging sessions from this caller', wait)
-    pit = (await unavailableOnFailure(() => deps.es.openPointInTime({ index: deps.index, keep_alive: KEEP_ALIVE }))).id
     created = now
+    ;({ backend, hits, snapshot } = await routed(search, async (b, opts) => {
+      if (b.name === 'elastic') await search.control.coverElasticSession()
+      const snap = await b.openSnapshot(opts)
+      try {
+        return { backend: b, ...(await b.page(snap, q, undefined, q.limit + 1, opts)) }
+      } catch (err) {
+        await b.closeSnapshot(snap).catch(() => {})
+        throw err
+      }
+    }))
   }
 
-  const { query, sort } = buildSearch(q)
-  let res
-  try {
-    res = await deps.es.search<EventDoc>({
-      pit: { id: pit, keep_alive: KEEP_ALIVE },
-      query,
-      sort: sort as never,
-      size: q.limit + 1,
-      ...(after ? { search_after: after as never } : {}),
-      track_total_hits: false,
-    })
-  } catch (err) {
-    if (q.cursor && isMissingSnapshot(err)) {
-      throw new CursorError('CursorExpired', 'the paging snapshot has expired; restart without a cursor')
-    }
-    throw toUnavailable(err)
-  }
-
-  const hits = res.hits.hits
   const examined = hits.slice(0, q.limit)
   const more = hits.length > q.limit
-  const snapshot = res.pit_id ?? pit
   let suppressed: Set<string>
   try {
     suppressed = await incompleteAmong(
       deps.db,
-      examined.map((h) => h._source!.uri),
+      examined.map((h) => h.doc.uri),
     )
   } catch (err) {
-    if (!q.cursor) await deps.es.closePointInTime({ id: snapshot }).catch(() => {})
+    if (!q.cursor) await backend.closeSnapshot(snapshot).catch(() => {})
     throw toUnavailable(err)
   }
-  const events = examined.filter((h) => !suppressed.has(h._source!.uri)).map((h) => view(h._source!))
+  const events = examined.filter((h) => !suppressed.has(h.doc.uri)).map((h) => view(h.doc))
 
   if (!more) {
-    await deps.es.closePointInTime({ id: snapshot }).catch(() => {})
+    await backend.closeSnapshot(snapshot).catch(() => {})
     return { events }
   }
   const last = examined[examined.length - 1]
   const cursor = encodeCursor(
-    { ...expect, pit: snapshot, after: last.sort ?? [], created, issued: now },
+    { ...expect, be: backend.name, pit: snapshot, after: last.sort, created, issued: now },
     deps.cursorKey,
   )
   if (!q.cursor) deps.sessions?.opened()
@@ -144,9 +182,14 @@ function isMissingSnapshot(err: unknown): boolean {
   return err.statusCode === 404 || text.includes('search_context_missing_exception') || text.includes('No search context found')
 }
 
+/** An Elasticsearch 4xx other than 429: a fault in the request, not the index being down. */
+function isClientError(err: unknown): boolean {
+  return err instanceof errors.ResponseError && !!err.statusCode && err.statusCode < 500 && err.statusCode !== 429
+}
+
 /** Elasticsearch or Postgres failing is the index being unavailable; an Elasticsearch 4xx stays an error. */
 function toUnavailable(err: unknown): unknown {
-  if (err instanceof errors.ResponseError && err.statusCode && err.statusCode < 500 && err.statusCode !== 429) return err
+  if (err instanceof XrpcError || isClientError(err)) return err
   return new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable')
 }
 
