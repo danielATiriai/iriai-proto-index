@@ -3,6 +3,7 @@ import type { Settings } from '../settings.js'
 import { COLLECTIONS, type Projector } from './projector.js'
 import { Handler, type JetstreamEvent } from './handler.js'
 import { isTransient } from './transient.js'
+import { SearchUpkeep } from '../search/verify.js'
 import {
   accountsAwaitingRebuild,
   knownDids,
@@ -17,6 +18,8 @@ export const CHECKPOINT = 'jetstream'
 const REPLAY_US = 5_000_000
 const FLUSH_MS = 1_000
 const RETRY_MS = 60_000
+/** Search upkeep: pruning, the first fill and the hourly comparison (spec 5.4). */
+const UPKEEP_MS = 10 * 60_000
 /** An event failing this many times with an error a retry cannot change is skipped and recorded. */
 const MAX_TRIES = 3
 const MAX_BACKOFF_MS = 30_000
@@ -63,6 +66,7 @@ export interface IngesterStatus {
 export class Ingester {
   readonly status: IngesterStatus = { connected: false, disconnectedSince: Date.now(), handled: 0, errors: 0, skipped: 0 }
   private handler: Handler
+  readonly upkeep: SearchUpkeep
   private stopped = false
   private ws?: Socket
   private queue: Promise<void> = Promise.resolve()
@@ -83,6 +87,7 @@ export class Ingester {
     options: IngesterOptions = {},
   ) {
     this.handler = new Handler(db, projector, log)
+    this.upkeep = new SearchUpkeep(db, projector, log)
     this.openSocket = options.openSocket ?? ((url) => new WebSocket(url))
     this.backoffMs = options.backoffMs ?? 1_000
   }
@@ -96,9 +101,15 @@ export class Ingester {
     this.handler.remember(await knownDids(this.db))
     this.handler.remember(this.settings.approvedAccounts)
     this.timers.push(setInterval(() => void this.flush(), FLUSH_MS))
-    this.timers.push(setInterval(() => this.enqueue(() => this.retry()), RETRY_MS))
+    // The first fill and the comparison run before this ingester writes
+    // anything (another ingester, during a deploy, may still write: the
+    // generation and the write lock cover that); the retry and upkeep timers
+    // start only after.
+    await this.upkeep.run()
     // Before the stream, so the stream's replay lands on top of the listing.
     await this.backfill()
+    this.timers.push(setInterval(() => this.enqueue(() => this.retry()), RETRY_MS))
+    this.timers.push(setInterval(() => this.enqueue(() => this.upkeep.run()), UPKEEP_MS))
     await this.connect()
   }
 

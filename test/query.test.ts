@@ -3,15 +3,17 @@ import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import type { Db } from '../src/db.js'
 import { assemble, type EventDoc } from '../src/index/assemble.js'
-import { connectElastic, ensureIndex, putDoc, type Elastic } from '../src/index/elastic.js'
+import { ElasticBackend, connectElastic, ensureIndex, putDoc, type Elastic } from '../src/index/elastic.js'
 import { applyChange, setIndexState } from '../src/ingest/store.js'
 import { CursorError } from '../src/query/cursor.js'
 import { parseEventQuery } from '../src/query/params.js'
 import { XrpcError, getEvent, queryEvents, type QueryDeps } from '../src/query/service.js'
+import type { BackendName } from '../src/search/backend.js'
+import { SearchControl, readControl } from '../src/search/control.js'
+import { PostgresBackend } from '../src/search/postgres.js'
 import { CID_A, CID_B, EVENT, OTHER, SIDECAR, STEWARD, eventValue, geo, row, sidecarValue } from './fixtures.js'
 import { databaseUrl, elasticUrl, freshDb, switchableDb } from './support.js'
 
-const INDEX = `test-events-${Date.now()}`
 const PEACE_PLAZA = 'latitude=37.785054&longitude=-122.429827'
 
 interface Spec {
@@ -38,7 +40,11 @@ const SPECS: Spec[] = [
 const uriOf = (key: string, did = STEWARD) => `at://${did}/${SIDECAR}/3k${key.repeat(11)}`
 const keyOf = (uri: string) => uri.split('/').pop()!.slice(2, 3)
 
-describe('query API', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_URL and TEST_ELASTICSEARCH_URL not set' }, () => {
+// Every filter, sort, paging and suppression test runs against both backends
+// with the same fixtures and the same expected answers (spec 10).
+for (const BACKEND of ['elastic', 'postgres'] as BackendName[]) {
+describe(`query API on ${BACKEND}`, { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_URL and TEST_ELASTICSEARCH_URL not set' }, () => {
+  const INDEX = `test-events-${BACKEND}-${Date.now()}`
   let db: Db
   let es: Elastic
   let deps: QueryDeps
@@ -51,10 +57,13 @@ describe('query API', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_UR
   }
 
   before(async () => {
-    db = await freshDb('query_test')
+    db = await freshDb(`query_test_${BACKEND}`)
     es = connectElastic(elasticUrl!)
     await ensureIndex(es, INDEX)
-    deps = { db, es, index: INDEX, serviceId: 'test', cursorKey: randomBytes(32) }
+    // Postgres is verified, so either backend may serve; the force picks one.
+    await db.query('update search_control set first_fill_done = true, pg_verified = true')
+    const search = { elastic: new ElasticBackend(es, INDEX), postgres: new PostgresBackend(db), control: new SearchControl(db), force: BACKEND }
+    deps = { db, search, serviceId: 'test', cursorKey: randomBytes(32) }
     for (const s of SPECS) {
       const did = s.did ?? STEWARD
       const rkey = `3e${s.key.repeat(11)}`
@@ -65,6 +74,7 @@ describe('query API', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_UR
       const result = assemble(sidecar, event, true)
       assert.ok(result.complete, s.key)
       await putDoc(es, INDEX, result.doc as EventDoc)
+      await new PostgresBackend(db).put(result.doc as EventDoc)
       await setIndexState(db, sidecar.uri, did, true, null)
       await applyChange(db, { did, collection: SIDECAR, rkey: sidecar.rkey, cid: CID_B, value: sidecar.value! })
       await applyChange(db, { did, collection: EVENT, rkey, cid: CID_A, value: event.value! })
@@ -103,6 +113,8 @@ describe('query API', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_UR
 
   it('sorts by start time with undated events last, and filters by author and eventUri', async () => {
     assert.deepEqual((await q('sort=startsAt&limit=100')).keys, ['f', 'a', 'e', 'b', 'u', 'x', 'c', 'd'])
+    // A coordinate with start-time order, as the acceptance script asks.
+    assert.deepEqual((await q(`${PEACE_PLAZA}&sort=startsAt&limit=100`)).keys, ['f', 'a', 'e', 'b', 'u', 'x', 'c', 'd'])
     assert.deepEqual((await q(`author=${OTHER}`)).keys, ['d'])
     assert.deepEqual((await q(`eventUri=at://${STEWARD}/${EVENT}/3e${'b'.repeat(11)}`)).keys, ['b'])
   })
@@ -149,8 +161,45 @@ describe('query API', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_UR
   })
 
   it('answers 503 ServiceUnavailable, not an empty page, when the index is down', async () => {
-    const down = { ...deps, es: connectElastic('http://127.0.0.1:1') }
+    // Elasticsearch down with Postgres not verified, or Postgres's search pool down.
+    const row = { ...(await readControl(db)), pgVerified: false }
+    const unverified = { current: async () => row, refresh: async () => row } as unknown as SearchControl
+    const deadPool = { query: async () => Promise.reject(Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })), connect: async () => Promise.reject(new Error('connect ECONNREFUSED')) }
+    const search =
+      BACKEND === 'elastic'
+        ? { ...deps.search, elastic: new ElasticBackend(connectElastic('http://127.0.0.1:1'), INDEX), control: unverified }
+        : { ...deps.search, postgres: new PostgresBackend(db, deadPool as never) }
+    const down = { ...deps, search }
     await assert.rejects(queryEvents(down, parseEventQuery(new URLSearchParams(PEACE_PLAZA))), (e: unknown) => e instanceof XrpcError && e.status === 503)
+    await assert.rejects(getEvent(down, uriOf('b')), (e: unknown) => e instanceof XrpcError && e.status === 503)
+  })
+
+  it(`answers from ${BACKEND} and says so in the cursor`, async () => {
+    const first = await q(`${PEACE_PLAZA}&limit=2`)
+    assert.ok(first.cursor)
+    assert.equal(deps.search.last?.backend, BACKEND)
+  })
+
+  it('pages by start time with undated events last, across the dated and undated parts', async () => {
+    const seen: string[] = []
+    let page = await q('sort=startsAt&limit=3')
+    seen.push(...page.keys)
+    while (page.cursor) {
+      page = await q('sort=startsAt&limit=3', { cursor: page.cursor })
+      seen.push(...page.keys)
+    }
+    assert.deepEqual(seen, ['f', 'a', 'e', 'b', 'u', 'x', 'c', 'd'])
+  })
+
+  it('pages with no sort and no coordinate in sidecar URI order', async () => {
+    const seen: string[] = []
+    let page = await q('limit=3')
+    seen.push(...page.keys)
+    while (page.cursor) {
+      page = await q('limit=3', { cursor: page.cursor })
+      seen.push(...page.keys)
+    }
+    assert.deepEqual(seen, ['d', 'a', 'b', 'c', 'e', 'f', 'u', 'x'])
   })
 
   it('answers 503 ServiceUnavailable when Postgres is down, for queryEvents and getEvent', async () => {
@@ -183,3 +232,4 @@ describe('query API', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABASE_UR
     })
   })
 })
+}

@@ -1,8 +1,9 @@
 import { AtUri } from '@atproto/syntax'
 import type { Db } from '../db.js'
 import { config, eventSidecarNsid } from '../contracts/contracts.js'
-import { assemble } from '../index/assemble.js'
-import { putDoc, removeDoc, type Elastic } from '../index/elastic.js'
+import { assemble, type EventDoc } from '../index/assemble.js'
+import { ElasticBackend, type Elastic } from '../index/elastic.js'
+import { PostgresBackend } from '../search/postgres.js'
 import { NotFound, fetchRecord, listRecords, resolvePds } from './pds.js'
 import {
   applyChange,
@@ -29,41 +30,87 @@ export interface ProjectorDeps {
  * Keeps the index in step with stored records: after any record changes, the
  * sidecars it affects are re-assembled and either indexed as complete events
  * or removed, with the outcome kept in index_state for suppression and health.
+ * Each change goes to Postgres first and then to today's Elasticsearch index
+ * exactly as before; an Elasticsearch failure fails the event, which is
+ * replayed (spec 5.1, PR 1).
  */
 export class Projector {
-  constructor(private deps: ProjectorDeps) {}
+  readonly postgres: PostgresBackend
+  readonly elastic: ElasticBackend
+
+  constructor(private deps: ProjectorDeps) {
+    this.postgres = new PostgresBackend(deps.db)
+    this.elastic = new ElasticBackend(deps.es, deps.index)
+  }
 
   /** Re-assembles everything a changed record affects. */
   async recordChanged(uri: string): Promise<void> {
     const collection = new AtUri(uri).collection
-    if (collection === eventSidecarNsid) await this.projectSidecar(uri)
+    if (collection === eventSidecarNsid) await this.projectSidecars([uri])
     else if (collection === config.communityEventCollection) {
-      for (const sidecar of await sidecarsFor(this.deps.db, uri)) await this.projectSidecar(sidecar)
+      await this.projectSidecars(await sidecarsFor(this.deps.db, uri))
     }
   }
 
   async projectAccount(did: string): Promise<void> {
-    for (const sidecar of await sidecarsOfAccount(this.deps.db, did)) await this.projectSidecar(sidecar)
+    await this.projectSidecars(await sidecarsOfAccount(this.deps.db, did))
   }
 
   async projectSidecar(uri: string, { hydrate = true } = {}): Promise<void> {
-    const { db, es, index } = this.deps
+    await this.projectSidecars([uri], { hydrate })
+  }
+
+  /**
+   * Postgres and index_state first, for every sidecar, then today's index.
+   * So an Elasticsearch failure, which fails the event for a replay, never
+   * leaves Postgres or the suppression state behind: a suppressed or deleted
+   * event is already out of Postgres and hidden from open sessions on both
+   * backends (incompleteAmong) before Elasticsearch is touched.
+   */
+  async projectSidecars(uris: string[], { hydrate = true } = {}): Promise<void> {
+    const { db } = this.deps
+    const done: { uri: string; doc?: EventDoc; hydrate?: string }[] = []
+    for (const uri of uris) {
+      const { result, did } = await this.projectPostgres(uri)
+      if (result.complete) {
+        await setIndexState(db, uri, did, true, null)
+        done.push({ uri, doc: result.doc })
+      } else {
+        await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
+        done.push({ uri, hydrate: result.hydrate })
+      }
+    }
+    for (const d of done) {
+      if (d.doc) await this.elastic.put(d.doc)
+      else await this.elastic.remove(d.uri)
+    }
+    for (const d of done) {
+      if (d.hydrate && hydrate && (await this.hydrate(d.hydrate))) await this.projectSidecars([d.uri], { hydrate: false })
+    }
+  }
+
+  /**
+   * Writes one sidecar's current state to Postgres only, from stored records
+   * and with no fetch: the first fill (spec 5.4). Today's index already holds
+   * the same state, and index_state is left as it is.
+   */
+  async fillPostgres(uri: string): Promise<void> {
+    await this.projectPostgres(uri)
+  }
+
+  /** Assembles uri from stored records and writes it to Postgres, as one step under the write lock. */
+  private async projectPostgres(uri: string) {
+    return this.postgres.project(uri, async (q) => {
+      const assembled = await this.assembleStored(uri, q)
+      return { ...assembled, doc: assembled.result.complete ? assembled.result.doc : undefined }
+    })
+  }
+
+  private async assembleStored(uri: string, db: Db = this.deps.db) {
     const sidecar = await getRecord(db, uri)
     const event = sidecar?.event_uri ? await getRecord(db, sidecar.event_uri) : undefined
     const servable = sidecar ? await isAccountServable(db, sidecar.did) : true
-    const result = assemble(sidecar, event, servable)
-    const did = sidecar?.did ?? new AtUri(uri).host
-
-    if (result.complete) {
-      await putDoc(es, index, result.doc)
-      await setIndexState(db, uri, did, true, null)
-      return
-    }
-    await removeDoc(es, index, uri)
-    await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
-    if (result.hydrate && hydrate && (await this.hydrate(result.hydrate))) {
-      await this.projectSidecar(uri, { hydrate: false })
-    }
+    return { result: assemble(sidecar, event, servable), did: sidecar?.did ?? new AtUri(uri).host }
   }
 
   /**

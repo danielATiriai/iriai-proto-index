@@ -2,21 +2,20 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync } from 'node:fs'
 import { config, contractsRoot } from '../contracts/contracts.js'
 import type { Db } from '../db.js'
-import type { Elastic } from '../index/elastic.js'
+import { route } from '../search/control.js'
 import { CHECKPOINT } from '../ingest/ingester.js'
 import { readCheckpoint } from '../ingest/store.js'
 import { CursorError } from './cursor.js'
 import { Limits } from './limits.js'
 import { InvalidRequest, parseEventQuery } from './params.js'
-import { XrpcError, getEvent, queryEvents, type QueryDeps } from './service.js'
+import { XrpcError, getEvent, probeNewSession, queryEvents, type QueryDeps, type Search } from './service.js'
 
 const contracts = JSON.parse(readFileSync(`${contractsRoot}SOURCE.json`, 'utf8')) as { tag: string; sha256: string }
 const ACCESS = 'Interim: open access with no key and per-caller rate limits (D-14). A project key and higher limits come with MVP.'
 
 export interface ServerDeps {
   db: Db
-  es: Elastic
-  index: string
+  search: Search
   serviceId: string
   cursorKey: Buffer
   rateLimitPerMinute: number
@@ -109,12 +108,26 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   } catch {
     out.database = 'unavailable'
   }
+  // index: what a new session gets right now, by running a first page's own
+  // routing steps (spec 5.2, 5.3); search: the state behind that choice.
+  const { search } = deps
   try {
-    const count = await deps.es.count({ index: deps.index })
-    out.index = { ok: true, events: count.count }
+    const row = await search.control.refresh()
+    out.search = {
+      force: search.force,
+      chosen: route(search.force, row) ?? null,
+      lastServed: search.last ?? null,
+      esInUse: true,
+      pgFirstFillDone: row.firstFillDone,
+      pgVerified: row.pgVerified,
+      comparedAt: row.comparedAt?.toISOString() ?? null,
+      comparison: row.note,
+      elasticCursorsUntil: row.elasticCursorsUntil.toISOString(),
+    }
   } catch {
-    out.index = { ok: false }
+    out.search = { unavailable: true }
   }
+  out.index = await probeNewSession(search)
   return { ...out, ...(deps.health?.() ?? {}) }
 }
 

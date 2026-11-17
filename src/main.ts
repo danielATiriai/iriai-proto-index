@@ -1,9 +1,11 @@
 import { createServer } from 'node:http'
-import { connect, migrate } from './db.js'
-import { connectElastic, ensureIndex } from './index/elastic.js'
+import { connect, migrate, searchWriterSeen } from './db.js'
+import { ElasticBackend, connectElastic } from './index/elastic.js'
 import { Ingester } from './ingest/ingester.js'
 import { Projector } from './ingest/projector.js'
 import { createQueryServer } from './query/server.js'
+import { SearchControl, controlPool } from './search/control.js'
+import { PostgresBackend, searchPool } from './search/postgres.js'
 import { loadSettings } from './settings.js'
 
 // One image, two Railway services: ROLE=ingester reads Jetstream and keeps
@@ -14,8 +16,14 @@ const log = (msg: string) => console.log(`[${settings.role}] ${msg}`)
 const db = connect(settings.databaseUrl, log)
 const es = connectElastic(settings.elasticUrl)
 
+// Neither role waits for Elasticsearch (spec 5.2): the ingester creates
+// today's index on its first write, and the query service routes around it.
 await waitFor('PostgreSQL', () => migrate(db))
-await waitFor('Elasticsearch', () => ensureIndex(es, settings.elasticIndex))
+log(
+  (await searchWriterSeen(db))
+    ? 'search: this service\'s connections are marked as writers of event_docs'
+    : 'search: WARNING: iriai.search_writer is not set on this service\'s connections (a pooler may drop it); each ingestion write will clear Postgres\'s verification',
+)
 
 let ingester: Ingester | undefined
 if (settings.role !== 'query') {
@@ -34,7 +42,17 @@ const server =
         res.setHeader('content-type', 'application/json')
         res.end(JSON.stringify({ ok, ...ingestionHealth() }))
       })
-    : createQueryServer({ db, es, index: settings.elasticIndex, ...settings, health: ingestionHealth })
+    : createQueryServer({
+        db,
+        search: {
+          elastic: new ElasticBackend(es, settings.elasticIndex),
+          postgres: new PostgresBackend(db, searchPool(settings.databaseUrl, log)),
+          control: new SearchControl(controlPool(settings.databaseUrl, log)),
+          force: settings.searchBackendForce,
+        },
+        ...settings,
+        health: ingestionHealth,
+      })
 server.listen(settings.port, () => log(`listening on ${settings.port}`))
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
