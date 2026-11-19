@@ -156,16 +156,6 @@ create table if not exists search_control (
   -- and verification count only while the generation has not moved since.
   fill_generation bigint not null default 0
 );
--- PR 2: the fill-and-compare version that last passed (CHECK_VERSION in
--- src/search/verify.ts); a lower one is filled and compared again once.
--- Only when missing, as for accounts.needs_rebuild.
-do $do$
-begin
-  if not exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'search_control' and column_name = 'checked_by') then
-    alter table search_control add column checked_by integer not null default 0;
-  end if;
-end
-$do$;
 -- Moved on by every change to an ingestion table from code that does not
 -- write event_docs. A sequence, not a row: it takes no lock (so the trigger
 -- cannot deadlock writers with one another) and does not roll back.
@@ -253,6 +243,18 @@ create table if not exists search_alerts (
   key text primary key,
   opened_at timestamptz not null
 );
+-- PR 2: the fill-and-compare version that last passed (CHECK_VERSION in
+-- src/search/verify.ts); a lower one is filled and compared again once.
+-- Only when missing, as for accounts.needs_rebuild, and last: the ALTER
+-- holds search_control exclusively until the migration commits, so it is
+-- not held while an earlier statement waits on an ingestion table.
+do $do$
+begin
+  if not exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'search_control' and column_name = 'checked_by') then
+    alter table search_control add column checked_by integer not null default 0;
+  end if;
+end
+$do$;
 `
 
 /**

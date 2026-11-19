@@ -13,7 +13,7 @@ import { createQueryServer } from '../src/query/server.js'
 import { XrpcError, getEvent, queryEvents, type QueryDeps, type Search } from '../src/query/service.js'
 import { bindingHash } from '../src/query/cursor.js'
 import { SearchControl, controlPool, readControl } from '../src/search/control.js'
-import { PostgresBackend, pageSql, searchPool } from '../src/search/postgres.js'
+import { PostgresBackend, WRITE_LOCK, pageSql, searchPool } from '../src/search/postgres.js'
 import { SearchUpkeep, comparable } from '../src/search/verify.js'
 import { EVENT, SIDECAR, eventValue, geo, sidecarValue } from './fixtures.js'
 import pg from 'pg'
@@ -613,7 +613,8 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     const opened: string[] = []
     const log: string[] = []
     const upkeep = new SearchUpkeep(db, projector, (m) => log.push(m), Date.now, { open: async (key) => void opened.push(key) })
-    await upkeep.run()
+    // The comparison on its own (upkeep while unverified fills first, which would repair it).
+    assert.equal((await upkeep.compare()).ok, false)
     let row = await readControl(db)
     assert.equal(row.pgVerified, false)
     assert.equal(row.firstFillDone, false, 'a difference voids the fill')
@@ -627,6 +628,14 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     row = await readControl(db)
     assert.equal(row.pgVerified, true, row.note ?? '')
     assert.equal((await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks2`))!.eventCid === 'bafychanged', false)
+  })
+
+  it('while unverified, fills and compares at every upkeep, not after an hour', async () => {
+    await db.query('update search_control set pg_verified = false, compared_at = now(), first_fill_done = true, fill_generation = search_generation_now(), checked_by = 2')
+    await projector.postgres.remove(`at://${AUTHOR}/${SIDECAR}/3ks1`)
+    await new SearchUpkeep(db, projector, () => {}).run()
+    assert.ok(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks1`))
+    assert.equal((await readControl(db)).pgVerified, true)
   })
 
   it('fails on a stale suppression state, and the fill rewrites it', async () => {
@@ -1038,6 +1047,24 @@ describe('projector writes', { skip: !databaseUrl && 'TEST_DATABASE_URL not set'
     assert.equal(comparable((await projector.postgres.get(sidecar))!), comparable((await projector.assembled(sidecar))!))
     await handler.handle(commit(EVENT, '3kew1'))
     assert.equal(await projector.postgres.get(sidecar), undefined)
+  })
+
+  it('writes the suppression state in the same locked transaction as the document', async () => {
+    await handler.handle(commit(EVENT, '3kew9', eventValue({ name: 'locked' })))
+    await handler.handle(commit(SIDECAR, '3ksw9', sidecarValue(AUTHOR, '3kew9', geo('37.78', '-122.43'))))
+    const s9 = `at://${AUTHOR}/${SIDECAR}/3ksw9`
+    await db.query(`update index_state set complete = false, reason = 'orphan' where uri = $1`, [s9])
+    // Another writer holds the write lock: neither row may change until it lets go.
+    const holder = await db.connect()
+    await holder.query('select pg_advisory_lock($1)', [WRITE_LOCK])
+    const projecting = projector.projectSidecar(s9, { hydrate: false })
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal((await db.query('select complete from index_state where uri = $1', [s9])).rows[0].complete, false)
+    await holder.query('select pg_advisory_unlock($1)', [WRITE_LOCK])
+    holder.release()
+    await projecting
+    assert.equal((await db.query('select complete from index_state where uri = $1', [s9])).rows[0].complete, true)
+    assert.ok(await projector.postgres.get(s9))
   })
 
   it('takes every event of a suppressed account out of Postgres and marks it', async () => {

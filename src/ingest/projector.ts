@@ -56,17 +56,10 @@ export class Projector {
 
   /** Postgres and index_state for every sidecar, then any hydration. */
   async projectSidecars(uris: string[], { hydrate = true } = {}): Promise<void> {
-    const { db } = this.deps
     const done: { uri: string; doc?: EventDoc; hydrate?: string }[] = []
     for (const uri of uris) {
-      const { result, did } = await this.projectPostgres(uri)
-      if (result.complete) {
-        await setIndexState(db, uri, did, true, null)
-        done.push({ uri, doc: result.doc })
-      } else {
-        await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
-        done.push({ uri, hydrate: result.hydrate })
-      }
+      const { result } = await this.projectPostgres(uri)
+      done.push(result.complete ? { uri, doc: result.doc } : { uri, hydrate: result.hydrate })
     }
     for (const d of done) {
       if (d.hydrate && hydrate && (await this.hydrate(d.hydrate))) await this.projectSidecars([d.uri], { hydrate: false })
@@ -83,11 +76,19 @@ export class Projector {
     await this.projectSidecars([uri], { hydrate: false })
   }
 
-  /** Assembles uri from stored records and writes it to Postgres, as one step under the write lock. */
+  /**
+   * Assembles uri from stored records and writes its index_state row and its
+   * event_docs row, as one transaction under the write lock, so the
+   * suppression state and the document never disagree. index_state is
+   * written before event_docs is touched, in the migration's table order.
+   */
   private async projectPostgres(uri: string) {
     return this.postgres.project(uri, async (q) => {
       const assembled = await this.assembleStored(uri, q)
-      return { ...assembled, doc: assembled.result.complete ? assembled.result.doc : undefined }
+      const { result, did } = assembled
+      if (result.complete) await setIndexState(q, uri, did, true, null)
+      else await setIndexState(q, uri, did, false, result.reason, result.issues ?? null)
+      return { ...assembled, doc: result.complete ? result.doc : undefined }
     })
   }
 

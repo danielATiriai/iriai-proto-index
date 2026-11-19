@@ -5,7 +5,6 @@ import type { Projector } from '../ingest/projector.js'
 import { readControl } from './control.js'
 import type { Issues } from './issues.js'
 
-const COMPARE_EVERY_MS = 60 * 60_000
 /**
  * The version of the fill-and-compare rule. A database whose recorded
  * version is lower (PR 1 verified it against today's index, enumerating only
@@ -29,7 +28,8 @@ export const SETTLE_MS = 30_000
  * past 61 minutes are deleted; the first fill runs until it finishes at an
  * unmoved generation; then the comparison runs right after it. A comparison
  * that finds a difference voids the fill, so the next upkeep fills again
- * (which repairs it) and compares; one that could not run is retried hourly.
+ * (which repairs it) and compares; while unverified, every upkeep fills and
+ * compares.
  * Verification holds until a comparison finds a difference or the generation
  * moves.
  */
@@ -114,7 +114,14 @@ export class SearchUpkeep {
       }
     } else {
       if (row.pgVerified) return
-      if (row.comparedAt && this.now() - row.comparedAt.getTime() < COMPARE_EVERY_MS) return
+      // Unverified (a comparison by older code, say, failed): fill and compare
+      // at every upkeep rather than waiting out the hour since that comparison.
+      try {
+        await this.fill()
+      } catch (err) {
+        this.log(`search: fill failed, retrying in 10 minutes: ${(err as Error).message}`)
+        return
+      }
     }
     const result = await this.compare()
     this.log(`search: comparison with stored records ${result.ok ? 'passed; Postgres is verified' : `did not pass: ${result.note}`}`)
