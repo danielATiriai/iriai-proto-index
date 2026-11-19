@@ -1,11 +1,11 @@
 import type { Db } from '../db.js'
-import { DEFAULT_THRESHOLDS, type Settings } from '../settings.js'
+import type { Settings } from '../settings.js'
 import { COLLECTIONS, type Projector } from './projector.js'
 import { Handler, type JetstreamEvent } from './handler.js'
 import { isTransient } from './transient.js'
-import { SearchUpkeep } from '../search/verify.js'
-import { SearchController } from '../search/controller.js'
 import { GitHubIssues } from '../search/issues.js'
+import { ScaleCheck } from '../search/scale.js'
+import { SearchUpkeep } from '../search/verify.js'
 import {
   accountsAwaitingRebuild,
   knownDids,
@@ -22,10 +22,6 @@ const FLUSH_MS = 1_000
 const RETRY_MS = 60_000
 /** Search upkeep: pruning, the first fill and the hourly comparison (spec 5.4). */
 const UPKEEP_MS = 10 * 60_000
-/** The scale controller (spec 6). */
-const CONTROLLER_MS = 10 * 60_000
-/** Keep-awake and replay while Elasticsearch is in use (spec 5.2). */
-const KEEP_MS = 2 * 60_000
 /** An event failing this many times with an error a retry cannot change is skipped and recorded. */
 const MAX_TRIES = 3
 const MAX_BACKOFF_MS = 30_000
@@ -62,7 +58,7 @@ export interface IngesterStatus {
  * calendar events and PlaceProto event sidecars, handles each event in order,
  * and stores the upstream cursor only after the events before it are handled.
  * A failed event closes the connection and is replayed on reconnect, with
- * backoff. Failures from Postgres, Elasticsearch or the network are retried
+ * backoff. Failures from Postgres or the network are retried
  * for as long as they last; only an event that keeps failing for another
  * reason is skipped, and recorded. Approved accounts are listed in full before
  * the stream starts. Sidecars waiting for their base event, and returning
@@ -73,7 +69,8 @@ export class Ingester {
   readonly status: IngesterStatus = { connected: false, disconnectedSince: Date.now(), handled: 0, errors: 0, skipped: 0 }
   private handler: Handler
   readonly upkeep: SearchUpkeep
-  readonly controller: SearchController
+  readonly scale: ScaleCheck
+  private scaling?: Promise<void>
   private stopped = false
   private ws?: Socket
   private queue: Promise<void> = Promise.resolve()
@@ -96,18 +93,7 @@ export class Ingester {
     this.handler = new Handler(db, projector, log)
     const issues = new GitHubIssues(db, settings.githubAlertToken, settings.githubAlertRepo, log)
     this.upkeep = new SearchUpkeep(db, projector, log, Date.now, issues)
-    this.controller = new SearchController({
-      db,
-      managed: projector.managed,
-      postgres: projector.postgres,
-      elastic: projector.elastic,
-      legacyIndex: settings.elasticIndex,
-      issues,
-      searchEs: settings.searchEs,
-      thresholds: settings.thresholds ?? DEFAULT_THRESHOLDS,
-      startedAt: new Date(),
-      log,
-    })
+    this.scale = new ScaleCheck(db, settings.thresholds, issues, log)
     this.openSocket = options.openSocket ?? ((url) => new WebSocket(url))
     this.backoffMs = options.backoffMs ?? 1_000
   }
@@ -130,21 +116,14 @@ export class Ingester {
     await this.backfill()
     this.timers.push(setInterval(() => this.enqueue(() => this.retry()), RETRY_MS))
     this.timers.push(setInterval(() => this.enqueue(() => this.upkeep.run()), UPKEEP_MS))
-    // The controller and the keep-awake run beside event handling, not in
-    // its queue: a build copies every event and must not hold up ingestion.
-    // Writes landing meanwhile are covered by external versions, es_pending
-    // and the reconcile (spec 5.1, 6.4).
-    const controller = this.controller
-    let ticking: Promise<void> = Promise.resolve()
-    const tick = () => (ticking = ticking.then(() => controller.tick()))
-    void controller.keep().then(tick)
-    this.timers.push(setInterval(() => void tick(), CONTROLLER_MS))
-    this.timers.push(setInterval(() => void controller.keep(), KEEP_MS))
-    this.ticking = () => ticking
+    // The scale check only counts and reads stats, so it runs beside events, not in their queue.
+    const scale = () => {
+      if (!this.scaling) this.scaling = this.scale.tick().finally(() => (this.scaling = undefined))
+    }
+    scale()
+    this.timers.push(setInterval(scale, UPKEEP_MS))
     await this.connect()
   }
-
-  private ticking: () => Promise<void> = () => Promise.resolve()
 
   async stop(): Promise<void> {
     this.stopped = true
@@ -152,7 +131,7 @@ export class Ingester {
     clearTimeout(this.reconnectTimer)
     this.ws?.close()
     await this.queue
-    await this.ticking()
+    await this.scaling
     await this.flush()
   }
 

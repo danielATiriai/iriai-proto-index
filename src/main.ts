@@ -1,6 +1,5 @@
 import { createServer } from 'node:http'
 import { connect, migrate, searchWriterSeen } from './db.js'
-import { ElasticBackend, connectElastic } from './index/elastic.js'
 import { Ingester } from './ingest/ingester.js'
 import { Projector } from './ingest/projector.js'
 import { createQueryServer } from './query/server.js'
@@ -15,10 +14,8 @@ import { loadSettings } from './settings.js'
 const settings = loadSettings()
 const log = (msg: string) => console.log(`[${settings.role}] ${msg}`)
 const db = connect(settings.databaseUrl, log)
-const es = connectElastic(settings.elasticUrl)
-
-// Neither role waits for Elasticsearch (spec 5.2): the ingester writes it only
-// while it is in use, and the query service routes around it.
+// From PR 2 neither role contacts Elasticsearch (spec 5.1, 5.2): search runs
+// on Postgres, and Elasticsearch can sleep.
 await waitFor('PostgreSQL', () => migrate(db))
 log(
   (await searchWriterSeen(db))
@@ -28,16 +25,15 @@ log(
 
 let ingester: Ingester | undefined
 if (settings.role !== 'query') {
-  const projector = new Projector({ db, es, index: settings.elasticIndex, plcUrl: settings.plcUrl, log })
+  const projector = new Projector({ db, plcUrl: settings.plcUrl, log })
   ingester = new Ingester(settings, db, projector, log)
   await ingester.start()
 }
 
-// Daily search stats and shadow queries (spec 6.1), on the query role.
-const stats = settings.role === 'ingester' ? undefined : new SearchStats(db, log)
+const stats = settings.role !== 'ingester' ? new SearchStats(db, log) : undefined
 stats?.start()
 
-const ingestionHealth = () => (ingester ? { ingester: { healthy: ingester.healthy, ...ingester.status } } : {})
+const ingestionHealth = () => (ingester ? { ingester: { healthy: ingester.healthy, ...ingester.status, scale: ingester.scale.last ?? null } } : {})
 const server =
   settings.role === 'ingester'
     ? createServer((_req, res) => {
@@ -50,12 +46,9 @@ const server =
     : createQueryServer({
         db,
         search: {
-          elastic: new ElasticBackend(es, settings.elasticIndex),
           postgres: new PostgresBackend(db, searchPool(settings.databaseUrl, log)),
           control: new SearchControl(controlPool(settings.databaseUrl, log)),
-          force: settings.searchBackendForce,
           stats,
-          recordFallback: async () => void (await db.query('insert into search_fallbacks default values')),
         },
         ...settings,
         health: ingestionHealth,
@@ -66,8 +59,9 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.on(signal, async () => {
     log(`${signal}: stopping`)
     server.close()
-    await stats?.flush().catch(() => {})
     await ingester?.stop()
+    stats?.stop()
+    await stats?.flush().catch(() => {})
     await db.end()
     process.exit(0)
   })

@@ -1,6 +1,6 @@
 # iriai-proto-index
 
-Iriai's PlaceProto ingestion, index and query API for YC (slices 1.4 and 1.5; BUILD-003, 004, 005). It reads community calendar events and `app.iriai.proto.event` sidecars from Bluesky's public Jetstream, keeps every complete event-plus-sidecar pair in PostgreSQL and Elasticsearch, and serves them through `app.iriai.proto.getEvent` and `app.iriai.proto.queryEvents`. The contracts are [iriai-proto v0.1.0](https://github.com/danielATiriai/iriai-proto/releases/tag/v0.1.0); the behaviour follows the PlaceProto specification §§4, 5 and 9.
+Iriai's PlaceProto ingestion, index and query API for YC (slices 1.4 and 1.5; BUILD-003, 004, 005). It reads community calendar events and `app.iriai.proto.event` sidecars from Bluesky's public Jetstream, keeps every complete event-plus-sidecar pair in PostgreSQL, searches them there, and serves them through `app.iriai.proto.getEvent` and `app.iriai.proto.queryEvents`. The contracts are [iriai-proto v0.1.0](https://github.com/danielATiriai/iriai-proto/releases/tag/v0.1.0); the behaviour follows the PlaceProto specification §§4, 5 and 9.
 
 Access is **interim** (D-14): open, with no key, and per-caller rate limits.
 
@@ -35,12 +35,12 @@ Iriai runs no stream of its own in YC (D-13). To follow PlaceProto events as the
   - Invalid records are kept out of the index and never repaired.
   - An inactive account's events leave search at once. A returning account's events come back only after a rebuild from its PDS succeeds; while its PDS can't be reached they stay out of search, and the rebuild is retried every minute.
   - Approved accounts (`APPROVED_ACCOUNTS`, by default the steward events.iriai.app) are listed in full at start, before the stream, so seeds written before ingestion began are indexed.
-  - A failed event closes the connection and is replayed on reconnect, with backoff up to 30 s. Postgres, Elasticsearch and network outages are retried for as long as they last. An event that fails three times for any other reason is skipped and recorded in `skipped_events`.
+  - A failed event closes the connection and is replayed on reconnect, with backoff up to 30 s. Postgres and network outages are retried for as long as they last. An event that fails three times for any other reason is skipped and recorded in `skipped_events`.
   - The ingester's `/health` answers 503 once Jetstream has been disconnected for a minute.
   - Locations resolve locally: geo coordinates, and H3 cell centres.
-- **Search on Postgres** (proposal "Search without Elasticsearch" v14, build 5e80472, PRs 1 and 2; spec and approval record in [docs/search-without-elasticsearch](docs/search-without-elasticsearch/)). Every index change goes to Postgres's `event_docs`, which gives it its version. Today's Elasticsearch index is no longer written; it is deleted 75 minutes after PR 2 first starts. On its first start the ingester fills `event_docs` from `index_state` and compares it once with every sidecar assembled again from stored records (with the same assembly code, so this catches a lost or stray write, not a wrong projection); health shows the result (`search.pgVerified`). Neither role waits for Elasticsearch at start-up.
-- **Elasticsearch only at scale** (PR 2). Elasticsearch is *in use* while `SEARCH_ES=on` on the ingester or the scale controller has switched it on. While in use, each write also goes to a managed index (`placeproto-events-<n>`) with Postgres's version, recorded in `es_pending` until Elasticsearch confirms it; a failed write never fails the event and is replayed every 2 minutes, with a cluster-health request that keeps a Serverless Elasticsearch awake. When use ends (only once Postgres is verified, every Elasticsearch cursor's hour has passed and today's index is due), the managed index is deleted and nothing more is sent, so Railway can put Elasticsearch to sleep. The controller runs every 10 minutes: it switches on after 3 days with at least 500 calls a day and a Postgres p95 of at least 250 ms or over 1% timeouts, or at 500,000 events; it builds, reconciles and checks a fresh index (same events in the same order as Postgres for each recent query shape) before moving searches to it; it drains back after at least 30 days on plus 14 quiet days, or at once on repeated fallbacks, a red cluster, 30 minutes without a keep-awake answer or a write pending for 30 minutes. At most one switch-on (one that reached on) in 30 days; a failed attempt is retried at the next tick, and two failures in 30 days disable it until a person clears `search_control.disabled`. Each switch-on, drain and failure opens a GitHub issue.
-- **Query** (`ROLE=query`) serves new sessions from Postgres, or from the managed Elasticsearch index while the controller has it on (`SEARCH_BACKEND_FORCE` overrides the state). The managed index serves only while it is in use, current, and has no write it has not confirmed for over 2 seconds; otherwise a verified Postgres answers. If Elasticsearch fails a first page or a `getEvent` within 2 seconds, a verified Postgres answers instead; otherwise the answer is `ServiceUnavailable`, as it is when `search_control` cannot be read. Each queryEvents call's search time, Postgres timeouts and query shape (coordinates rounded to about 100 m, no caller address) are added to a daily `search_stats` row; while Elasticsearch serves, 1 in 10 first pages also runs on Postgres afterwards so its speed stays known. A cursor stays on the backend that opened its session. It checks PostgreSQL to suppress results that stopped being complete. Rate limits are per caller, by the `X-Real-IP` address Railway's edge sets. `query.iriai.app` stays DNS-only on Cloudflare, since proxying it would make every caller a Cloudflare address. A paging session counts against the hourly limit only when an answer returns a cursor.
+- **Search on Postgres** (proposal "Search without Elasticsearch" v14, build 5e80472, with the packet amendment to D2 and D3 that Daniel chose on Nov 19: turn Elasticsearch off only; spec and approval record in [docs/search-without-elasticsearch](docs/search-without-elasticsearch/)). Every index change goes to Postgres's `event_docs` only; nothing writes to, reads from or connects to Elasticsearch. On its first start, and again whenever code that does not keep `event_docs` changes an ingestion table, the ingester fills `event_docs` from every stored sidecar, then compares it with the sidecars assembled again from the stored records, hourly until they match once; health shows the result (`search.pgVerified`).
+  - **Scale check.** Every 10 minutes the ingester records the event count and the query service's daily search timings (`search_stats`, kept 90 days). It opens one GitHub issue (at most one a day per cause) when the scale trigger is met: `SEARCH_ON_EVENTS` events, or 3 days that each have at least `SEARCH_ON_MIN_CALLS` calls and a p95 of at least `SEARCH_ON_P95_MS` or a timeout rate over `SEARCH_ON_TIMEOUT_RATE`. It also opens one after a failed comparison and after 3 checks in a row find Postgres unverified. Switching a search engine back on is a later, separate change; this check only says when it is due.
+- **Query** (`ROLE=query`) serves the API from Postgres once it is verified; otherwise the answer is `ServiceUnavailable`. Cursors issued by Elasticsearch before Nov 17 all answer `CursorExpired`. It checks PostgreSQL to suppress results that stopped being complete. Rate limits are per caller, by the `X-Real-IP` address Railway's edge sets. `query.iriai.app` stays DNS-only on Cloudflare, since proxying it would make every caller a Cloudflare address. A paging session counts against the hourly limit only when an answer returns a cursor.
 - **Health** (`/xrpc/_health`) reports ingestion lag, sidecar counts by state, inactive accounts and accounts awaiting a rebuild, skipped events, the backend serving new sessions with its size (`index`), and the search state behind that choice (`search`).
 
 ## Configuration
@@ -48,7 +48,6 @@ Iriai runs no stream of its own in YC (D-13). To follow PlaceProto events as the
 | Variable | Used by | Default |
 |---|---|---|
 | `DATABASE_URL` | both | required |
-| `ELASTICSEARCH_URL` | both | required |
 | `ROLE` | both | `all` (both in one process) |
 | `CURSOR_KEY` | query | required: 32 random bytes, base64 |
 | `JETSTREAM_URL` | ingester | `wss://jetstream2.us-east.bsky.network/subscribe` |
@@ -56,17 +55,16 @@ Iriai runs no stream of its own in YC (D-13). To follow PlaceProto events as the
 | `APPROVED_ACCOUNTS` | ingester | the steward, `did:plc:kd5s7zyp7nje43ievnqhgzrr` |
 | `RATE_LIMIT_PER_MINUTE`, `PAGING_SESSIONS_PER_HOUR` | query | 120, 60 |
 | `SERVICE_ID` | query | `query.iriai.app` |
-| `SEARCH_BACKEND_FORCE` | query | unset: follow the controller's state; `postgres` or `elastic` overrides it, within the rule above |
-| `SEARCH_ES` | ingester | `on`: Elasticsearch in use whatever the state; `off` lets use end |
-| `GITHUB_ALERT_TOKEN` | ingester | unset: issues are only logged. Fine-grained, iriai-proto-index only, Issues read and write |
-| `SEARCH_ON_MIN_CALLS`, `SEARCH_ON_P95_MS`, `SEARCH_ON_TIMEOUT_RATE`, `SEARCH_ON_EVENTS`, `SEARCH_OFF_P95_MS`, `SEARCH_OFF_EVENTS` | ingester | 500, 250, 0.01, 500000, 100, 250000 |
+| `GITHUB_ALERT_TOKEN` | ingester | none: search issues are only logged |
+| `GITHUB_ALERT_REPO` | ingester | `danielATiriai/iriai-proto-index` |
+| `SEARCH_ON_EVENTS`, `SEARCH_ON_MIN_CALLS`, `SEARCH_ON_P95_MS`, `SEARCH_ON_TIMEOUT_RATE` | ingester | 500000, 500, 250, 0.01 |
 
 ## Development
 
 ```
 npm ci
 npm test                                   # unit tests
-TEST_DATABASE_URL=postgres://… TEST_ELASTICSEARCH_URL=http://localhost:9200 npm test   # everything, as CI runs it
+TEST_DATABASE_URL=postgres://… npm test   # everything, as CI runs it
 npm run check-contracts                    # vendored contracts match the v0.1.0 release
 node scripts/acceptance.mjs [base URL]     # live check of a deployed query service
 node scripts/stream-check.mjs [host]       # spike 3: stop, restart and replay on public Jetstream

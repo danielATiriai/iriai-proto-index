@@ -9,8 +9,10 @@ export interface Issues {
 
 /**
  * Opens GitHub issues in iriai-proto-index (spec 6.4; GitHub emails Daniel)
- * with GITHUB_ALERT_TOKEN. Our code only opens issues. Without a token, or
- * when GitHub refuses, the issue is logged and health keeps the last note.
+ * with GITHUB_ALERT_TOKEN. Our code only opens issues. A cause's day starts
+ * only once GitHub has accepted its issue: without a token, or when GitHub
+ * refuses, the claim is withdrawn and the issue is only logged, so the next
+ * call (each cause is checked again every 10 minutes or hourly) tries again.
  */
 export class GitHubIssues implements Issues {
   constructor(
@@ -33,6 +35,7 @@ export class GitHubIssues implements Issues {
       return
     }
     if (!this.token) {
+      await this.db.query('delete from search_alerts where key = $1', [key]).catch(() => {})
       this.log(`search issue (GITHUB_ALERT_TOKEN not set, so not opened): ${title}: ${body}`)
       return
     }
@@ -46,7 +49,7 @@ export class GitHubIssues implements Issues {
           'content-type': 'application/json',
           'user-agent': 'iriai-proto-index',
         },
-        body: JSON.stringify({ title, body: `${body}\n\n_Opened by the search controller in the ingester (spec 6.4)._` }),
+        body: JSON.stringify({ title, body: `${body}\n\n_Opened by the ingester's search checks (spec 6)._` }),
         signal: AbortSignal.timeout(10_000),
       })
       if (!res.ok) throw new Error(`GitHub answered ${res.status}`)

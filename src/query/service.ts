@@ -1,4 +1,3 @@
-import { errors } from '@elastic/elasticsearch'
 import { AtUri, isValidDid } from '@atproto/syntax'
 import type { Db } from '../db.js'
 import { eventSidecarNsid } from '../contracts/contracts.js'
@@ -6,9 +5,9 @@ import type { EventDoc } from '../index/assemble.js'
 import { getRecord, incompleteAmong } from '../ingest/store.js'
 import { CursorError, bindingHash, decodeCursor, encodeCursor } from './cursor.js'
 import { InvalidRequest, bindingOf, type EventQuery } from './params.js'
-import type { BackendName, CallOptions, Hit, SearchBackend } from '../search/backend.js'
-import { route, type Route, type RouteRow, type SearchControl } from '../search/control.js'
-import type { SearchStats } from '../search/stats.js'
+import type { CallOptions, Hit, SearchBackend } from '../search/backend.js'
+import { route, type ControlRow, type Route, type SearchControl } from '../search/control.js'
+import { isTimeout, type SearchStats } from '../search/stats.js'
 
 export class XrpcError extends Error {
   constructor(
@@ -38,94 +37,47 @@ export interface QueryDeps {
   sessions?: { wait: () => number; opened: () => void }
 }
 
-/** Both backends and what routes between them (spec 5.2). */
+/**
+ * The search backend and what decides whether it may serve (spec 5.2). From
+ * PR 2 Elasticsearch is not written, so it never serves: every new session
+ * and getEvent goes to a verified Postgres, and nothing is sent to
+ * Elasticsearch, so it can sleep.
+ */
 export interface Search {
-  /** Elasticsearch; withIndex gives the managed index search_control names. */
-  elastic: SearchBackend & { withIndex?(index: string): SearchBackend }
   postgres: SearchBackend
   control: SearchControl
-  /** SEARCH_BACKEND_FORCE; unset follows the controller's state. */
-  force?: BackendName
-  /** Daily stats and shadow queries (spec 6.1); absent in tests that do not need them. */
+  /** Daily stats for the scale check (spec 6.1); absent in tests that do not need them. */
   stats?: SearchStats
-  /** Records a first page that fell back from Elasticsearch to Postgres (spec 6.4, on). */
-  recordFallback?: () => Promise<void>
   /** The last backend chosen for a new session or getEvent, and why, for health. */
   last?: Route & { at: string }
 }
-
-/** The managed index search_control names, else the backend as given (tests). */
-function elasticFor(search: Search, row: Partial<RouteRow>): SearchBackend {
-  return row.elasticIndex && search.elastic.withIndex ? search.elastic.withIndex(row.elasticIndex) : search.elastic
-}
-
-/** An Elasticsearch first page (or getEvent) that has not answered in this long falls back (spec 5.2). */
-export const ELASTIC_FIRST_MS = 2_000
 
 function view(doc: EventDoc): EventView {
   return { ...doc.view, version: { eventCid: doc.eventCid, sidecarCid: doc.sidecarCid } }
 }
 
 /**
- * Routes a new session or a getEvent: the chosen backend if it may serve,
- * else Postgres if verified, else ServiceUnavailable. Once Postgres is
- * verified, Elasticsearch failing within 2 seconds counts as not serving and
- * Postgres takes the request; until then a managed index that may serve
- * behaves as today's did, with its own timeouts. If search_control cannot be
- * read, neither backend can be shown to may serve, so the request is refused.
+ * Routes a new session or a getEvent (spec 5.2): Postgres if verified, else
+ * ServiceUnavailable. If search_control cannot be read, Postgres counts as
+ * unverified.
  */
 export async function routed<T>(search: Search, run: (backend: SearchBackend, opts: CallOptions) => Promise<T>, record = true): Promise<T> {
-  const note = (last: NonNullable<Search['last']>) => {
-    if (record) search.last = last
-  }
   // Read fresh every time (one row by key): a cleared verification takes effect at once.
-  const row = await verification(search)
-  const chosen = route(search.force, row)
+  const chosen = route(await verification(search))
   if (!chosen) throw new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable: Postgres is not verified yet')
-  if (chosen.backend === 'postgres') {
-    note({ ...chosen, at: new Date().toISOString() })
-    return unavailableOnFailure(() => run(search.postgres, {}))
-  }
-  try {
-    const result = await run(elasticFor(search, row), row.pgVerified ? { signal: AbortSignal.timeout(ELASTIC_FIRST_MS) } : {})
-    note({ ...chosen, at: new Date().toISOString() })
-    return result
-  } catch (err) {
-    // Looked at again before falling back: verification may have been
-    // cleared during the Elasticsearch attempt.
-    if (!row.pgVerified || !(await verification(search)).pgVerified) throw toUnavailable(err)
-    note({ backend: 'postgres', reason: 'Elasticsearch failed or took over 2 s; Postgres verified', at: new Date().toISOString() })
-    if (record) void search.recordFallback?.().catch(() => {})
-    return unavailableOnFailure(() => run(search.postgres, {}))
-  }
+  if (record) search.last = { ...chosen, at: new Date().toISOString() }
+  return unavailableOnFailure(() => run(search.postgres, {}))
 }
 
-/** What a search_control read that fails or stalls counts as: nothing may serve. */
-const UNREADABLE: RouteRow = { pgVerified: false, state: 'off', esInUse: false, esCurrent: false, elasticIndex: null, pendingStale: true }
-
-/**
- * search_control read fresh (SearchControl bounds every read to 500 ms): a
- * read that fails or stalls counts as neither backend may serve.
- */
-export async function verification(search: Pick<Search, 'control'>): Promise<RouteRow> {
-  return search.control.refresh().catch(() => UNREADABLE)
+/** search_control read fresh (SearchControl bounds every read to 500 ms): a read that fails or stalls counts as unverified. */
+export async function verification(search: Pick<Search, 'control'>): Promise<Pick<ControlRow, 'pgVerified'>> {
+  return search.control.refresh().catch(() => ({ pgVerified: false }))
 }
 
-/**
- * What health reports as the index: the same steps a first page takes
- * (routing, the Elasticsearch session cover, the 2-second fallback, the
- * re-check before it), with a count in place of the search.
- */
+/** What health reports as the index: a first page's routing, with a count in place of the search. */
 export async function probeNewSession(search: Search): Promise<{ ok: boolean; backend?: string; events?: number }> {
   try {
-    return await routed(
-      search,
-      async (b, opts) => {
-        if (b.name === 'elastic') await search.control.coverElasticSession()
-        return { ok: true, backend: b.name, events: await b.count(opts) }
-      },
-      false,
-    )
+    return await routed(search, async (b, opts) => ({ ok: true, backend: b.name, events: await b.count(opts) }), false)
   } catch {
     return { ok: false }
   }
@@ -165,44 +117,41 @@ export async function getEvent(deps: QueryDeps, uriParam: string | null): Promis
 export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now()): Promise<{ events: EventView[]; cursor?: string }> {
   const expect = { svc: deps.serviceId, bind: bindingHash(bindingOf(q)) }
   const { search } = deps
-  search.stats?.call(q)
   let backend: SearchBackend
   let created: number
   let hits: Hit[]
   let snapshot: string
+  search.stats?.call()
 
   if (q.cursor) {
     const state = decodeCursor(q.cursor, deps.cursorKey, expect, now)
-    // Cursors from before the backend field are Elasticsearch's.
-    backend = (state.be ?? 'elastic') === 'postgres' ? search.postgres : search.elastic
+    // Cursors from before the backend field are Elasticsearch's. Elasticsearch
+    // has issued none since Nov 17 (SEARCH_BACKEND_FORCE=postgres), so every
+    // one is past its hour; it is never sent there, which would wake it.
+    if ((state.be ?? 'elastic') !== 'postgres') throw new CursorError('CursorExpired', 'the paging snapshot has expired; restart without a cursor')
+    backend = search.postgres
     created = state.created
-    if (backend.name === 'elastic' && !(await unavailableOnFailure(() => search.control.elasticCursorsOpen()))) {
-      throw new CursorError('CursorExpired', 'the paging snapshot has expired; restart without a cursor')
-    }
     try {
-      ;({ hits, snapshot } = await timed(search, backend, () => backend.page(state.pit, q, state.after, q.limit + 1)))
+      ;({ hits, snapshot } = await timed(search, () => backend.page(state.pit, q, state.after, q.limit + 1)))
     } catch (err) {
-      if (isMissingSnapshot(err)) throw new CursorError('CursorExpired', 'the paging snapshot has expired; restart without a cursor')
       throw toUnavailable(err)
     }
   } else {
     const wait = deps.sessions?.wait() ?? 0
     if (wait > 0) throw new XrpcError(429, 'RateLimitExceeded', 'too many paging sessions from this caller', wait)
     created = now
-    ;({ backend, hits, snapshot } = await routed(search, async (b, opts) => {
-      if (b.name === 'elastic') await search.control.coverElasticSession()
-      return timed(search, b, async () => {
+    // Timed whole: opening the snapshot waits for a search connection.
+    ;({ backend, hits, snapshot } = await routed(search, (b, opts) =>
+      timed(search, async () => {
         const snap = await b.openSnapshot(opts)
         try {
           return { backend: b, ...(await b.page(snap, q, undefined, q.limit + 1, opts)) }
         } catch (err) {
-          // Not awaited: closing must not hold up the fallback (spec 5.2).
           release(b, snap)
           throw err
         }
-      })
-    }))
-    if (backend.name === 'elastic' && search.stats?.shadowDue()) shadow(search, q)
+      }),
+    ))
   }
 
   const examined = hits.slice(0, q.limit)
@@ -232,56 +181,29 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
   return { events, cursor }
 }
 
-/** Times a search step for the daily stats; a Postgres search stopped by its 2 s limit counts as a timeout. */
-async function timed<T>(search: Search, backend: SearchBackend, step: () => Promise<T>): Promise<T> {
+/** Times a search step for the daily stats (spec 6.1); one that ran out of time counts as 2 s and a timeout. */
+async function timed<T>(search: Search, step: () => Promise<T>): Promise<T> {
   const started = performance.now()
   try {
     const out = await step()
-    search.stats?.search(backend.name, performance.now() - started)
+    search.stats?.search(performance.now() - started)
     return out
   } catch (err) {
-    if (backend.name === 'postgres' && (err as { code?: string }).code === '57014') search.stats?.search('postgres', 2_000, true)
+    if (isTimeout(err)) search.stats?.search(2_000, true)
     throw err
   }
 }
 
 /**
- * A shadow query (spec 6.1, D2 A): the same first page on Postgres, after the
- * Elasticsearch answer, so Postgres's own p95 stays known while it does not serve.
- */
-function shadow(search: Search, q: EventQuery): void {
-  setImmediate(() => {
-    void timed(search, search.postgres, async () => {
-      const snap = await search.postgres.openSnapshot()
-      await search.postgres.page(snap, q, undefined, q.limit + 1)
-    }).catch(() => {})
-  })
-}
-
-/**
- * Closes a snapshot without waiting: closing never holds up an answer, and a
- * snapshot that fails to close expires on its own (Elasticsearch's keep-alive).
+ * Closes a snapshot without waiting: closing never holds up an answer.
  */
 function release(backend: SearchBackend, snapshot: string): void {
   void backend.closeSnapshot(snapshot).catch(() => {})
 }
 
-function isMissingSnapshot(err: unknown): boolean {
-  if (!(err instanceof errors.ResponseError)) return false
-  const text = JSON.stringify(err.body ?? '')
-  return err.statusCode === 404 || text.includes('search_context_missing_exception') || text.includes('No search context found')
-}
-
-/** An Elasticsearch 4xx other than 429: a fault in the request, not the index being down. */
-function isClientError(err: unknown): boolean {
-  return err instanceof errors.ResponseError && !!err.statusCode && err.statusCode < 500 && err.statusCode !== 429
-}
-
-/** Elasticsearch or Postgres failing is the index being unavailable; an Elasticsearch 4xx stays an error. */
+/** Postgres failing is the index being unavailable. */
 function toUnavailable(err: unknown): unknown {
   if (err instanceof XrpcError) return err
-  // A missing index (a fresh environment before the ingester's first write) is the index being unavailable.
-  if (isClientError(err) && !JSON.stringify((err as errors.ResponseError).body ?? '').includes('index_not_found_exception')) return err
   return new XrpcError(503, 'ServiceUnavailable', 'the event index is unavailable')
 }
 

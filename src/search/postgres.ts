@@ -50,9 +50,9 @@ export class PostgresBackend implements SearchBackend {
    * over a later one, whichever ingester made each (two run at once while a
    * deploy overlaps). Returns what was assembled.
    */
-  async project<T extends { doc?: EventDoc }>(uri: string, assemble: (q: Db) => Promise<T>): Promise<T & { write: WriteResult }> {
+  async project<T extends { doc?: EventDoc }>(uri: string, assemble: (q: Db) => Promise<T>): Promise<T> {
     let out: T | undefined
-    const write = await this.write(
+    await this.write(
       uri,
       async (client, version) => {
         if (out!.doc) await insertDoc(client, version, out!.doc)
@@ -63,32 +63,29 @@ export class PostgresBackend implements SearchBackend {
         out = await assemble(client as unknown as Db)
       },
     )
-    return { ...out!, write }
+    return out!
   }
 
   /** Replaces the current row for doc.uri; returns the write's version. */
   async put(doc: EventDoc): Promise<bigint> {
-    return (await this.write(doc.uri, (client, version) => insertDoc(client, version, doc))).version
+    return this.write(doc.uri, (client, version) => insertDoc(client, version, doc))
   }
 
   /** Closes the current row for uri, if any; returns the write's version. */
   async remove(uri: string): Promise<bigint> {
-    return (await this.write(uri, async () => {})).version
+    return this.write(uri, async () => {})
   }
 
   /**
    * One transaction: the write lock first, then a new number (a number taken
    * before the lock could be lower than a snapshot read in between), then the
-   * current row is closed with it and `insert` adds the new one. While
-   * Elasticsearch is in use, the same transaction records the write in
-   * es_pending (spec 4.2); es_in_use changes only under the write lock, so
-   * the answer holds until the commit.
+   * current row is closed with it and `insert` adds the new one.
    */
   private async write(
     uri: string,
     insert: (client: pg.PoolClient, version: string) => Promise<void>,
     prepare?: (client: pg.PoolClient) => Promise<void>,
-  ): Promise<WriteResult> {
+  ): Promise<bigint> {
     const client = await checkout(this.db)
     try {
       await client.query('begin')
@@ -101,14 +98,8 @@ export class PostgresBackend implements SearchBackend {
         [uri, version],
       )
       await insert(client, version)
-      const es = await client.query<{ elastic_index: string | null }>(
-        `with c as (select elastic_index from search_control where id = 1 and es_in_use),
-              p as (insert into es_pending (uri, version) select $1, $2 from c returning 1)
-         select elastic_index from c, (select count(*) from p) as n`,
-        [uri, version],
-      )
       await client.query('commit')
-      return { version: BigInt(version), ...(es.rows.length ? { es: { index: es.rows[0].elastic_index } } : {}) }
+      return BigInt(version)
     } catch (err) {
       await client.query('rollback').catch(() => {})
       throw err
@@ -192,12 +183,6 @@ export class PostgresBackend implements SearchBackend {
     const res = await this.db.query<{ uri: string; doc: EventDoc }>('select uri, doc from event_docs where closed_version is null')
     return new Map(res.rows.map((r) => [r.uri, r.doc]))
   }
-}
-
-export interface WriteResult {
-  version: bigint
-  /** Present while Elasticsearch is in use: the write is in es_pending, for the managed index named (null before one is created). */
-  es?: { index: string | null }
 }
 
 async function insertDoc(client: pg.PoolClient, version: string, doc: EventDoc): Promise<void> {

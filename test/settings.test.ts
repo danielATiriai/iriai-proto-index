@@ -2,7 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { STEWARD_DID, loadSettings } from '../src/settings.js'
 
-const base = { DATABASE_URL: 'postgres://db', ELASTICSEARCH_URL: 'http://es:9200' }
+const base = { DATABASE_URL: 'postgres://db' }
 const key = Buffer.alloc(32, 7).toString('base64')
 
 describe('settings', () => {
@@ -23,6 +23,6 @@ describe('settings', () => {
     const s = loadSettings({ ...base, ROLE: 'ingester', APPROVED_ACCOUNTS: 'did:plc:a, did:plc:b,' })
     assert.deepEqual(s.approvedAccounts, ['did:plc:a', 'did:plc:b'])
     assert.throws(() => loadSettings({ ...base, ROLE: 'indexer' }), /ROLE/)
-    assert.throws(() => loadSettings({ ROLE: 'ingester', ELASTICSEARCH_URL: 'http://es:9200' }), /DATABASE_URL/)
+    assert.throws(() => loadSettings({ ROLE: 'ingester' }), /DATABASE_URL/)
   })
 })

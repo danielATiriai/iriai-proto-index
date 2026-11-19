@@ -6,7 +6,7 @@ import { Projector } from '../src/ingest/projector.js'
 import { readCheckpoint, writeCheckpoint } from '../src/ingest/store.js'
 import type { Settings } from '../src/settings.js'
 import { EVENT, SIDECAR, eventValue, geo, sidecarValue } from './fixtures.js'
-import { databaseUrl, fakeNetwork, freshDb, memoryElastic, switchableDb, type FakeNetwork } from './support.js'
+import { databaseUrl, fakeNetwork, freshDb, switchableDb, type FakeNetwork } from './support.js'
 
 const AUTHOR = 'did:plc:ingesterauthor0000000000'
 
@@ -45,7 +45,6 @@ async function until(cond: () => boolean | Promise<boolean>, what: string, ms = 
 describe('ingester', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () => {
   let base: Db
   let db: ReturnType<typeof switchableDb>
-  let es: ReturnType<typeof memoryElastic>
   let net: FakeNetwork
   let sockets: FakeSocket[]
   let ingester: Ingester
@@ -78,9 +77,8 @@ describe('ingester', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () =
   beforeEach(async () => {
     await ingester?.stop()
     db = switchableDb(base)
-    es = memoryElastic()
     sockets = []
-    const projector = new Projector({ db, es, index: 'events', plcUrl: net.url, log: () => {} })
+    const projector = new Projector({ db, plcUrl: net.url, log: () => {} })
     ingester = new Ingester(settings, db, projector, process.env.DEBUG_INGESTER ? console.log : () => {}, {
       openSocket: (url) => (sockets.push(new FakeSocket(new URL(url))), latest()),
       backoffMs: 5,
@@ -105,37 +103,6 @@ describe('ingester', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () =
     const second = await next(2)
     assert.equal(second.url.searchParams.get('cursor'), String(t - 5_000_000))
     assert.equal(ingester.status.connected, true)
-  })
-
-  it('keeps ingesting through an Elasticsearch outage, and the replay catches the managed index up', async () => {
-    await base.query(`update search_control set es_in_use = true, es_current = true, elastic_index = 'events'`)
-    await ingester.start()
-    const sidecar = commit('3ksidecar0030', SIDECAR, sidecarValue(AUTHOR, '3kevent000030', geo('37.78', '-122.43')))
-    const event = commit('3kevent000030', EVENT, eventValue({ name: 'Survives an outage' }))
-    net.records.set(`at://${AUTHOR}/${EVENT}/3kevent000030`, { cid: 'bafyreibjytuinufvu3gimfxyqjbptuws7g3sdekx2igq5dts4ar7jgxjbq', value: event.commit.record })
-
-    es.down = true
-    const s = await next(1)
-    s.send(event)
-    s.send(sidecar)
-    await until(() => ingester.status.lastEventUs === sidecar.time_us, 'the sidecar to be handled while Elasticsearch is down')
-    assert.equal(s.closed, false)
-    assert.equal(ingester.status.errors, 0)
-    const uri = `at://${AUTHOR}/${SIDECAR}/3ksidecar0030`
-    assert.ok((await base.query('select 1 from event_docs where uri = $1 and closed_version is null', [uri])).rowCount)
-    assert.equal(es.docs.has(uri), false)
-    assert.ok((await base.query('select 1 from es_pending where uri = $1', [uri])).rowCount)
-
-    es.down = false
-    await new Promise((r) => setTimeout(r, 2_100))
-    await ingester.controller.keep()
-    assert.ok(es.docs.has(uri))
-    assert.equal((await base.query('select 1 from es_pending where uri = $1', [uri])).rowCount, 0)
-    const skipped = await base.query('select count(*)::int as n from skipped_events')
-    assert.equal(skipped.rows[0].n, 0)
-    // The checkpoint moves only once both are handled.
-    await until(async () => (await readCheckpoint(base, CHECKPOINT))?.cursor === sidecar.time_us, 'the checkpoint', 3_000)
-    await base.query(`update search_control set es_in_use = false, es_current = false, elastic_index = null`)
   })
 
   it('skips and records an event that fails the same way every time, then carries on', async () => {

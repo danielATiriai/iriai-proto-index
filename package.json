@@ -16,7 +16,6 @@
   "dependencies": {
     "@atproto/lexicon": "0.7.16",
     "@atproto/syntax": "0.7.6",
-    "@elastic/elasticsearch": "8.19.2",
     "h3-js": "4.5.0",
     "pg": "8.16.3"
   },

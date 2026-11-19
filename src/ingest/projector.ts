@@ -2,9 +2,7 @@ import { AtUri } from '@atproto/syntax'
 import type { Db } from '../db.js'
 import { config, eventSidecarNsid } from '../contracts/contracts.js'
 import { assemble, type EventDoc } from '../index/assemble.js'
-import { ElasticBackend, type Elastic } from '../index/elastic.js'
-import { ManagedIndex } from '../search/managed.js'
-import { PostgresBackend, type WriteResult } from '../search/postgres.js'
+import { PostgresBackend } from '../search/postgres.js'
 import { NotFound, fetchRecord, listRecords, resolvePds } from './pds.js'
 import {
   applyChange,
@@ -21,8 +19,6 @@ export const COLLECTIONS = [config.communityEventCollection, eventSidecarNsid]
 
 export interface ProjectorDeps {
   db: Db
-  es: Elastic
-  index: string
   plcUrl: string
   log?: (msg: string) => void
 }
@@ -31,22 +27,14 @@ export interface ProjectorDeps {
  * Keeps the index in step with stored records: after any record changes, the
  * sidecars it affects are re-assembled and either indexed as complete events
  * or removed, with the outcome kept in index_state for suppression and health.
- * Each change goes to Postgres, which gives it its version. Today's
- * Elasticsearch index is no longer written (spec 5.1, PR 2). While
- * Elasticsearch is in use, the change is also written to the managed index
- * with that version; a failure never fails the event: its es_pending row stays
- * and is replayed.
+ * From PR 2 each change goes to Postgres only: Elasticsearch is not written
+ * (spec 5.1).
  */
 export class Projector {
   readonly postgres: PostgresBackend
-  /** Elasticsearch; a managed index is reached through withIndex. Today's index is never written from PR 2. */
-  readonly elastic: ElasticBackend
-  readonly managed: ManagedIndex
 
   constructor(private deps: ProjectorDeps) {
     this.postgres = new PostgresBackend(deps.db)
-    this.elastic = new ElasticBackend(deps.es, deps.index)
-    this.managed = new ManagedIndex(deps.db, deps.es, this.postgres, deps.log)
   }
 
   /** Re-assembles everything a changed record affects. */
@@ -66,44 +54,31 @@ export class Projector {
     await this.projectSidecars([uri], { hydrate })
   }
 
-  /**
-   * Postgres and index_state first, for every sidecar, then the managed
-   * index while Elasticsearch is in use. A managed-index write that fails or
-   * takes over 2 seconds is left to the replay (spec 5.1): the event goes on.
-   */
+  /** Postgres and index_state for every sidecar, then any hydration. */
   async projectSidecars(uris: string[], { hydrate = true } = {}): Promise<void> {
     const { db } = this.deps
-    const done: { uri: string; doc?: EventDoc; hydrate?: string; write: WriteResult }[] = []
+    const done: { uri: string; doc?: EventDoc; hydrate?: string }[] = []
     for (const uri of uris) {
-      const { result, did, write } = await this.projectPostgres(uri)
+      const { result, did } = await this.projectPostgres(uri)
       if (result.complete) {
         await setIndexState(db, uri, did, true, null)
-        done.push({ uri, doc: result.doc, write })
+        done.push({ uri, doc: result.doc })
       } else {
         await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
-        done.push({ uri, hydrate: result.hydrate, write })
+        done.push({ uri, hydrate: result.hydrate })
       }
     }
-    for (const d of done) await this.managed.afterWrite(d.uri, d.write, d.doc)
     for (const d of done) {
       if (d.hydrate && hydrate && (await this.hydrate(d.hydrate))) await this.projectSidecars([d.uri], { hydrate: false })
     }
   }
 
   /**
-   * Writes one sidecar's current state to Postgres, from stored records and
-   * with no fetch: the first fill (spec 5.4). index_state is left as it is.
-   * While Elasticsearch is in use the write reaches the managed index too.
+   * Writes one sidecar's current state to Postgres only, from stored records
+   * and with no fetch: the first fill (spec 5.4). index_state is left as it is.
    */
   async fillPostgres(uri: string): Promise<void> {
-    const { result, write } = await this.projectPostgres(uri)
-    await this.managed.afterWrite(uri, write, result.complete ? result.doc : undefined)
-  }
-
-  /** What stored records assemble to for uri, without writing: the self-comparison (verify.ts). */
-  async assembled(uri: string, db: Db = this.deps.db): Promise<EventDoc | undefined> {
-    const { result } = await this.assembleStored(uri, db)
-    return result.complete ? result.doc : undefined
+    await this.projectPostgres(uri)
   }
 
   /** Assembles uri from stored records and writes it to Postgres, as one step under the write lock. */
@@ -112,6 +87,15 @@ export class Projector {
       const assembled = await this.assembleStored(uri, q)
       return { ...assembled, doc: assembled.result.complete ? assembled.result.doc : undefined }
     })
+  }
+
+  /**
+   * One sidecar as stored records assemble it now, through `db` (a snapshot
+   * for the comparison), or undefined when incomplete. Writes nothing.
+   */
+  async assembled(uri: string, db: Db = this.deps.db): Promise<EventDoc | undefined> {
+    const { result } = await this.assembleStored(uri, db)
+    return result.complete ? result.doc : undefined
   }
 
   private async assembleStored(uri: string, db: Db = this.deps.db) {

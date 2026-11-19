@@ -10,20 +10,7 @@ export interface ControlRow {
   pgVerified: boolean
   comparedAt: Date | null
   note: string | null
-  /** The controller's state (spec 6.4). */
-  state: ControllerState
-  since: Date
-  esInUse: boolean
-  esCurrent: boolean
-  elasticIndex: string | null
-  /** An es_pending row is older than 2 seconds: the managed index may not serve (spec 5.2). */
-  pendingStale: boolean
-  esSeenAt: Date | null
-  disabled: boolean
-  controllerNote: string | null
 }
-
-export type ControllerState = 'off' | 'ready' | 'starting' | 'backfilling' | 'verifying' | 'on' | 'draining'
 
 const READ_EVERY_MS = 30_000
 /**
@@ -34,10 +21,6 @@ const READ_EVERY_MS = 30_000
  * falls back rather than hanging.
  */
 export const CONTROL_MS = 500
-/** Every Elasticsearch first page leaves at least this long for its session (spec 3). */
-const COVER_MS = 61 * 60_000
-/** Extending when under 60 minutes remain is enough: a session never outlives 60 of the 61 minutes. */
-const EXTEND_BELOW_MS = 60 * 60_000
 
 /**
  * The query service's own small pool for search_control: two connections,
@@ -61,23 +44,12 @@ export async function readControl(db: Db): Promise<ControlRow> {
     compared_at: Date | null
     note: string | null
     stale: boolean
-    state: ControllerState
-    since: Date
-    es_in_use: boolean
-    es_current: boolean
-    elastic_index: string | null
-    pending_stale: boolean
-    es_seen_at: Date | null
-    disabled: boolean
-    controller_note: string | null
   }>(
     `select g::text as generation, elastic_cursors_until,
             first_fill_done and fill_generation = g as first_fill_done,
             pg_verified and fill_generation = g as pg_verified,
             case when fill_generation = g then compared_at end as compared_at,
-            note, first_fill_done and fill_generation <> g as stale,
-            state, since, es_in_use, es_current, elastic_index, es_seen_at, disabled, controller_note,
-            exists (select 1 from es_pending where at < clock_timestamp() - interval '2 seconds') as pending_stale
+            note, first_fill_done and fill_generation <> g as stale
      from search_control, search_generation_now() as g where id = 1`,
   )
   const r = res.rows[0]
@@ -88,15 +60,6 @@ export async function readControl(db: Db): Promise<ControlRow> {
     pgVerified: r.pg_verified,
     comparedAt: r.compared_at,
     note: r.stale ? 'ingestion tables were changed by code that does not write event_docs; filling again' : r.note,
-    state: r.state,
-    since: r.since,
-    esInUse: r.es_in_use,
-    esCurrent: r.es_current,
-    elasticIndex: r.elastic_index,
-    pendingStale: r.pending_stale,
-    esSeenAt: r.es_seen_at,
-    disabled: r.disabled,
-    controllerNote: r.controller_note,
   }
 }
 
@@ -122,35 +85,6 @@ export class SearchControl {
     this.row = await this.bounded((q) => readControl(q))
     this.readAt = this.now()
     return this.row
-  }
-
-  /**
-   * Whether an Elasticsearch cursor may still be sent to Elasticsearch. A
-   * stale "no" is checked against the table before it is given, since another
-   * replica may have moved the time on.
-   */
-  async elasticCursorsOpen(): Promise<boolean> {
-    if ((await this.current()).elasticCursorsUntil.getTime() > this.now()) return true
-    return (await this.refresh()).elasticCursorsUntil.getTime() > this.now()
-  }
-
-  /**
-   * Called before an Elasticsearch first page returns: moves
-   * elastic_cursors_until to at least now + 61 minutes, writing the row only
-   * when less than 60 minutes remain.
-   */
-  async coverElasticSession(): Promise<void> {
-    const row = await this.current()
-    if (row.elasticCursorsUntil.getTime() >= this.now() + EXTEND_BELOW_MS) return
-    const until = new Date(this.now() + COVER_MS)
-    const res = await this.bounded((q) =>
-      q.query<{ elastic_cursors_until: Date }>(
-        `update search_control set elastic_cursors_until = greatest(elastic_cursors_until, $1), updated_at = now()
-         where id = 1 returning elastic_cursors_until`,
-        [until],
-      ),
-    )
-    row.elasticCursorsUntil = res.rows[0].elastic_cursors_until
   }
 
   /**
@@ -207,28 +141,10 @@ export interface Route {
   reason: string
 }
 
-export type RouteRow = Pick<ControlRow, 'pgVerified' | 'state' | 'esInUse' | 'esCurrent' | 'elasticIndex' | 'pendingStale'>
-
 /**
- * Whether the managed index may serve a new session (spec 5.2): Elasticsearch
- * is in use, the index named holds every current row, and no write it has not
- * confirmed is older than 2 seconds. Today's index never serves from PR 2.
+ * The rule of spec 5.2 for a new session from PR 2: Postgres if verified,
+ * else nothing. Elasticsearch is not written, so it may not serve.
  */
-export function elasticMayServe(row: RouteRow): boolean {
-  return row.esInUse && row.esCurrent && !!row.elasticIndex && !row.pendingStale
-}
-
-/**
- * The rule of spec 5.2 for a new session: the chosen backend (SEARCH_BACKEND_FORCE,
- * else Elasticsearch in the controller's state on, else Postgres) if it may
- * serve, else Postgres if verified, else nothing.
- */
-export function route(force: BackendName | undefined, row: RouteRow): Route | undefined {
-  const chosen: BackendName = force ?? (row.state === 'on' ? 'elastic' : 'postgres')
-  const why = force ? `SEARCH_BACKEND_FORCE=${force}` : `controller state ${row.state}`
-  if (chosen === 'elastic' && elasticMayServe(row)) return { backend: 'elastic', reason: `${why}; the managed index may serve` }
-  if (row.pgVerified) {
-    return { backend: 'postgres', reason: chosen === 'postgres' ? `${why}; Postgres verified` : `${why}, but the managed index may not serve; Postgres verified` }
-  }
-  return undefined
+export function route(row: Pick<ControlRow, 'pgVerified'>): Route | undefined {
+  return row.pgVerified ? { backend: 'postgres', reason: 'Postgres verified; Elasticsearch is off' } : undefined
 }

@@ -1,4 +1,5 @@
 import { checkout, type Db } from '../db.js'
+import { eventSidecarNsid } from '../contracts/contracts.js'
 import type { EventDoc } from '../index/assemble.js'
 import type { Projector } from '../ingest/projector.js'
 import { readControl } from './control.js'
@@ -91,25 +92,30 @@ export class SearchUpkeep {
         this.log(`search: first fill failed, retrying in 10 minutes: ${(err as Error).message}`)
         return
       }
+      // The fill cleared verification and the last comparison: compare now,
+      // not by the row read before the fill.
+    } else {
+      if (row.pgVerified) return
+      if (row.comparedAt && this.now() - row.comparedAt.getTime() < COMPARE_EVERY_MS) return
     }
-    if (row.pgVerified) return
-    if (row.comparedAt && this.now() - row.comparedAt.getTime() < COMPARE_EVERY_MS) return
     const result = await this.compare()
-    this.log(`search: comparison ${result.ok ? 'passed; Postgres is verified' : `did not pass: ${result.note}`}`)
+    this.log(`search: comparison with stored records ${result.ok ? 'passed; Postgres is verified' : `did not pass: ${result.note}`}`)
   }
 
   /**
-   * Projects every sidecar in index_state into Postgres, then records that
-   * the first fill is done, unless code that does not write event_docs
-   * changed an ingestion table meanwhile (the generation moved): then it runs
-   * again. It reads nothing until every write that moved the generation to
-   * the value it read is visible (settle). The comparison needs no such wait:
-   * it publishes only at the fill's generation, unmoved.
+   * Projects every sidecar into Postgres, then records that the first fill is
+   * done, unless code that does not write event_docs changed an ingestion
+   * table meanwhile (the generation moved): then it runs again. The sidecars
+   * are every one with a stored record, in index_state, or in event_docs, so
+   * a sidecar whose index_state row was never written is not missed. It reads
+   * nothing until every write that moved the generation to the value it read
+   * is visible (settle). The comparison needs no such wait: it publishes only
+   * at the fill's generation, unmoved.
    */
   async firstFill(): Promise<number> {
     const { generation } = await readControl(this.db)
     await this.settle()
-    const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
+    const uris = await expectedSidecars(this.db)
     for (const uri of uris) await this.projector.fillPostgres(uri)
     const res = await (this.publisher ?? this.db).query(
       `update search_control set first_fill_done = true, fill_generation = $1, pg_verified = false, compared_at = null, note = null, updated_at = now()
@@ -122,40 +128,47 @@ export class SearchUpkeep {
 
   /**
    * Compares Postgres's current documents by document id and content (not
-   * versions, and not indexedAt, which records when each copy was written)
-   * with every sidecar assembled again from stored records. From PR 2 today's
-   * index is no longer written, and a managed index is itself filled from
-   * Postgres, so it is never the copy: comparing with it could not fail. The result is recorded only if the fill is done and
-   * the generation has not moved since the comparison began: a pass sets
-   * pg_verified and a comparison that finds a difference clears it; one that
-   * could not run changes nothing. Upkeep runs on one ingester at a time.
+   * versions, and not indexedAt) with every sidecar assembled again from the
+   * stored records, both read in one snapshot. From PR 2 today's index is not
+   * written, so it is no longer the copy. The sidecars are enumerated from
+   * records, index_state and event_docs together. A uri that differs in the
+   * snapshot is read again once, in a fresh snapshot, so a write that landed
+   * between the two tables does not fail the check. The result is recorded
+   * only if the fill is done and the generation has not moved since the
+   * comparison began: a pass sets pg_verified and a comparison that finds a
+   * difference clears it; one that could not run changes nothing. The note
+   * (public in health and in the issue) has counts only; the uris go to the
+   * ingester log.
    */
   async compare(): Promise<{ ok: boolean; note: string }> {
     let ok = false
     let ran = false
     let note: string
-    const against = 'stored records assembled again'
     const { generation } = await readControl(this.db)
     try {
-      const [pg, es] = [await this.projector.postgres.currentDocs(), await this.reassembled()]
-      const missing = [...es.keys()].filter((uri) => !pg.has(uri))
-      const extra = [...pg.keys()].filter((uri) => !es.has(uri))
-      const differ = [...pg.keys()].filter((uri) => es.has(uri) && comparable(pg.get(uri)!) !== comparable(es.get(uri)!))
+      let found = await this.differences()
+      if (found.total > 0) found = await this.differences(found.uris)
       ran = true
-      ok = missing.length === 0 && extra.length === 0 && differ.length === 0
+      ok = found.total === 0
       note = ok
-        ? `matched ${against}: ${pg.size} documents`
+        ? `matched stored records: ${found.size} documents`
         : [
-            missing.length && `${missing.length} only in ${against} (${missing.slice(0, LISTED).join(', ')})`,
-            extra.length && `${extra.length} only in Postgres (${extra.slice(0, LISTED).join(', ')})`,
-            differ.length && `${differ.length} with different content (${differ.slice(0, LISTED).join(', ')})`,
+            found.missing.length && `${found.missing.length} only in stored records`,
+            found.extra.length && `${found.extra.length} only in Postgres`,
+            found.differ.length && `${found.differ.length} with different content`,
           ]
             .filter(Boolean)
             .join('; ')
+      if (!ok) {
+        this.log(
+          `search: comparison differences: only in stored records ${found.missing.slice(0, LISTED).join(', ')}; ` +
+            `only in Postgres ${found.extra.slice(0, LISTED).join(', ')}; different ${found.differ.slice(0, LISTED).join(', ')}`,
+        )
+      }
     } catch (err) {
       // Health is public, so the note says what happened, not the error text.
       this.log(`search: comparison could not run: ${(err as Error).message}`)
-      note = `comparison with ${against} could not run; retrying at the next upkeep`
+      note = 'comparison could not run: Postgres did not answer; retrying at the next upkeep'
     }
     const res = await (this.publisher ?? this.db).query(
       `update search_control
@@ -167,25 +180,41 @@ export class SearchUpkeep {
     if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }
     if (ran && !ok) {
       await this.issues
-        ?.open(
-          'comparison',
-          'Search: the Postgres comparison did not pass',
-          `Postgres is not verified, so it may not serve new sessions; upkeep compares again hourly. ${note}`,
-        )
+        ?.open('comparison', 'Search: the Postgres comparison did not pass', `Postgres is not verified, so search answers 503; upkeep compares again hourly. ${note}.`)
         .catch((err) => this.log(`search: could not open the comparison issue: ${(err as Error).message}`))
     }
     return { ok, note }
   }
 
-  /** Every complete sidecar in index_state as stored records assemble it now. */
-  private async reassembled(): Promise<Map<string, EventDoc>> {
-    const out = new Map<string, EventDoc>()
-    const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
-    for (const uri of uris) {
-      const doc = await this.projector.assembled(uri)
-      if (doc) out.set(uri, doc)
+  /** Postgres against stored records in one read-only snapshot, for every sidecar or only `only`. */
+  private async differences(only?: string[]) {
+    const client = await checkout(this.db)
+    try {
+      await client.query('begin isolation level repeatable read read only')
+      const q = client as unknown as Db
+      const rows = (
+        await q.query<{ uri: string; doc: EventDoc }>(
+          `select uri, doc from event_docs where closed_version is null${only ? ' and uri = any($1)' : ''}`,
+          only ? [only] : [],
+        )
+      ).rows
+      const pg = new Map(rows.map((r) => [r.uri, r.doc]))
+      const stored = new Map<string, EventDoc>()
+      for (const uri of only ?? (await expectedSidecars(q))) {
+        const doc = await this.projector.assembled(uri, q)
+        if (doc) stored.set(uri, doc)
+      }
+      await client.query('commit')
+      const missing = [...stored.keys()].filter((uri) => !pg.has(uri))
+      const extra = [...pg.keys()].filter((uri) => !stored.has(uri))
+      const differ = [...pg.keys()].filter((uri) => stored.has(uri) && comparable(pg.get(uri)!) !== comparable(stored.get(uri)!))
+      return { size: pg.size, missing, extra, differ, uris: [...missing, ...extra, ...differ], total: missing.length + extra.length + differ.length }
+    } catch (err) {
+      await client.query('rollback').catch(() => {})
+      throw err
+    } finally {
+      client.release()
     }
-    return out
   }
 
   /**
@@ -229,4 +258,16 @@ function canonical(value: unknown): string {
       .join(',')}}`
   }
   return JSON.stringify(value)
+}
+
+/** Every sidecar Postgres should account for: stored as a record, in index_state, or current in event_docs. */
+export async function expectedSidecars(db: Db): Promise<string[]> {
+  const res = await db.query<{ uri: string }>(
+    `select uri collate "C" as uri from records where collection = $1
+     union select uri collate "C" from index_state
+     union select uri collate "C" from event_docs where closed_version is null
+     order by 1`,
+    [eventSidecarNsid],
+  )
+  return res.rows.map((r) => r.uri)
 }

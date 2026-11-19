@@ -10,11 +10,10 @@ export interface Hit {
 }
 
 /**
- * What the query service reads from either search backend (spec 3). The
- * Postgres backend (src/search/postgres.ts) and Elasticsearch (src/index/
- * elastic.ts) both implement it, with the same filters, sorts and paging.
- * Writes differ and are not part of it: Postgres gives each write its version
- * (spec 4.2), and in PR 1 today's Elasticsearch index keeps its own.
+ * What the query service reads from a search backend (spec 3). From PR 2
+ * only Postgres (src/search/postgres.ts) implements it; an Elasticsearch
+ * backend comes back with the switch-on PR (spec 6.4). Writes are not part of
+ * it: Postgres gives each write its version (spec 4.2).
  */
 export interface SearchBackend {
   readonly name: BackendName
@@ -27,6 +26,6 @@ export interface SearchBackend {
 }
 
 export interface CallOptions {
-  /** Aborts the call: the first page of an Elasticsearch session gets 2 seconds (spec 5.2). */
+  /** Aborts the call. */
   signal?: AbortSignal
 }
