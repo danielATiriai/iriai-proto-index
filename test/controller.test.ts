@@ -398,6 +398,7 @@ describe('the managed index and the controller', { skip: !databaseUrl && 'TEST_D
     r = await readControl(db)
     assert.equal(r.state, 'off')
     assert.equal(r.disabled, true)
+    assert.ok(opened.includes('disabled'), 'the disabling failure has its own issue, outside the first one\'s daily de-duplication')
     await c.tick()
     assert.equal((await readControl(db)).state, 'off', 'disabled: does nothing until a person clears it')
   })

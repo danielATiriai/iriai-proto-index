@@ -62,7 +62,6 @@ export const writeAlias = (index: string) => `${index}-write`
 export const WRITE_MS = 2_000
 const WRITE_OPTS = { requestTimeout: WRITE_MS, maxRetries: 0 }
 
-/** Creates a managed index: today's mapping, deletes remembered 2 hours (spec 5.4), and its write alias. */
 /**
  * Keeps Elasticsearch from creating a managed index or its write alias by
  * itself: a delete with an external version re-creates a missing index, so
@@ -72,6 +71,7 @@ const WRITE_OPTS = { requestTimeout: WRITE_MS, maxRetries: 0 }
  */
 export const AUTO_CREATE = `+${MANAGED_PREFIX}v*,-${MANAGED_PREFIX}*,+*`
 
+/** Creates a managed index: today's mapping, deletes remembered 2 hours (spec 5.4), and its write alias. */
 export async function createManagedIndex(es: Elastic, index: string): Promise<void> {
   await es.cluster.putSettings({ persistent: { 'action.auto_create_index': AUTO_CREATE } }, { requestTimeout: 10_000 })
   await es.indices.create({

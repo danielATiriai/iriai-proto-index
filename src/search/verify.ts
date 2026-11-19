@@ -123,10 +123,9 @@ export class SearchUpkeep {
   /**
    * Compares Postgres's current documents by document id and content (not
    * versions, and not indexedAt, which records when each copy was written)
-   * with another copy. From PR 2 today's index is no longer written, so the
-   * copy is the managed index when one is current (itself filled from
-   * Postgres, so this catches a lost write, not a wrong projection), else
-   * every sidecar assembled again from stored records with the same code. The result is recorded only if the fill is done and
+   * with every sidecar assembled again from stored records. From PR 2 today's
+   * index is no longer written, and a managed index is itself filled from
+   * Postgres, so it is never the copy: comparing with it could not fail. The result is recorded only if the fill is done and
    * the generation has not moved since the comparison began: a pass sets
    * pg_verified and a comparison that finds a difference clears it; one that
    * could not run changes nothing. Upkeep runs on one ingester at a time.
@@ -138,10 +137,8 @@ export class SearchUpkeep {
     let against = 'its copy'
     const { generation } = await readControl(this.db)
     try {
-      const control = await readControl(this.db)
-      const managed = control.esInUse && control.esCurrent && control.elasticIndex
-      against = managed ? `the managed index ${control.elasticIndex}` : 'stored records assembled again'
-      const [pg, es] = [await this.projector.postgres.currentDocs(), managed ? await this.projector.elastic.withIndex(control.elasticIndex!).allDocs() : await this.reassembled()]
+      against = 'stored records assembled again'
+      const [pg, es] = [await this.projector.postgres.currentDocs(), await this.reassembled()]
       const missing = [...es.keys()].filter((uri) => !pg.has(uri))
       const extra = [...pg.keys()].filter((uri) => !es.has(uri))
       const differ = [...pg.keys()].filter((uri) => es.has(uri) && comparable(pg.get(uri)!) !== comparable(es.get(uri)!))

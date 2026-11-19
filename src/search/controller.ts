@@ -195,19 +195,20 @@ export class SearchController {
       // With SEARCH_ES on, use does not end; draining has already moved new
       // sessions to Postgres, which off keeps doing.
       if (row.state === 'draining') return this.setState('off', 'drained; SEARCH_ES=on keeps Elasticsearch in use')
+      // Before any Elasticsearch call, so an outage still names this cause.
+      if ((await managed.stalePending(STUCK_MS)) > 0) {
+        await this.deps.issues.open(
+          'pending',
+          'Search: Elasticsearch writes have been pending for over 30 minutes',
+          'The managed index may not serve while they wait, so new sessions use Postgres. Details are in the ingester log.',
+        )
+      }
       try {
         if (!row.esCurrent && !['starting', 'backfilling', 'verifying'].includes(row.state)) {
           const index = await managed.build(legacyIndex)
           await managed.markCurrent(index)
         }
         await managed.dropLegacyWhenDue(legacyIndex)
-        if ((await managed.stalePending(STUCK_MS)) > 0) {
-          await this.deps.issues.open(
-            'pending',
-            'Search: Elasticsearch writes have been pending for over 30 minutes',
-            'The managed index may not serve while they wait, so new sessions use Postgres. Details are in the ingester log.',
-          )
-        }
         const fresh = await readControl(this.deps.db)
         if (fresh.esCurrent && fresh.elasticIndex && (await this.reconcileDue())) {
           const n = await managed.reconcile(fresh.elasticIndex)
@@ -230,7 +231,7 @@ export class SearchController {
         await this.deps.issues.open(
           'unverified-outage',
           'Search: Postgres is not verified and Elasticsearch is not in use, so search answers 503',
-          'Upkeep fills and compares Postgres again every 10 minutes. Setting SEARCH_ES=on on the ingester builds a managed index, which SEARCH_BACKEND_FORCE=elastic on the query service can then serve.',
+          'Upkeep compares Postgres with stored records again hourly, and fills it again when an ingestion table changed. Setting SEARCH_ES=on on the ingester builds a managed index from Postgres, which SEARCH_BACKEND_FORCE=elastic on the query service can then serve; it does not verify Postgres.',
         )
       }
       return
@@ -329,11 +330,13 @@ export class SearchController {
       [FAILURES_TO_DISABLE],
     )
     const { n, disabled } = res.rows[0]
+    // Its own key: a second failure comes minutes after the first (a failed
+    // attempt retries), inside the first one's daily de-duplication.
     const fresh = await readControl(this.deps.db)
     if (fresh.elasticIndex && !fresh.esCurrent) await this.deps.managed.dropCandidate(fresh.elasticIndex)
     await this.setState('off', `switch-on failed: ${why}`)
     await this.deps.issues.open(
-      'failure',
+      disabled ? 'disabled' : 'failure',
       'Search: turning Elasticsearch on failed',
       `${why}. Search stays on Postgres. Failures in the last 30 days: ${n}.${disabled ? ' The controller is now disabled until a person clears search_control.disabled.' : ''}`,
     )

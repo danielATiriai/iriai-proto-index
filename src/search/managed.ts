@@ -197,8 +197,13 @@ export class ManagedIndex {
    * (spec 6.4, an event that changed during the check).
    */
   async reconcile(index: string): Promise<number> {
+    // Read under the shared write lock, as a snapshot is: every write numbered
+    // up to the mark has committed.
     const mark = BigInt(
-      (await this.db.query<{ w: string }>(`select (case when is_called then last_value else 0 end)::text as w from event_doc_version`)).rows[0].w,
+      await this.underWriteLock(
+        async (c) => (await c.query<{ w: string }>(`select (case when is_called then last_value else 0 end)::text as w from event_doc_version`)).rows[0].w,
+        true,
+      ),
     )
     const inEs = await managedVersions(this.es, index)
     // Closed rows too: a document whose row closed after the scan began is
@@ -338,11 +343,11 @@ export class ManagedIndex {
     return Number((await this.db.query<{ n: string }>('select count(*) as n from es_pending')).rows[0].n)
   }
 
-  private async underWriteLock<R>(work: (c: Db) => Promise<R>): Promise<R> {
+  private async underWriteLock<R>(work: (c: Db) => Promise<R>, shared = false): Promise<R> {
     const client = await checkout(this.db)
     try {
       await client.query('begin')
-      await client.query('select pg_advisory_xact_lock($1)', [WRITE_LOCK])
+      await client.query(shared ? 'select pg_advisory_xact_lock_shared($1)' : 'select pg_advisory_xact_lock($1)', [WRITE_LOCK])
       const out = await work(client as unknown as Db)
       await client.query('commit')
       return out

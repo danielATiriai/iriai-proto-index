@@ -817,7 +817,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
   before(async () => {
     db = await freshDb('upkeep_test')
     es = connectElastic(elasticUrl!)
-    // From PR 2 the comparison's independent copy is the current managed index.
+    // A current managed index, written alongside Postgres; from PR 2 the comparison reads stored records, never it.
     await createManagedIndex(es, INDEX)
     await db.query(`update search_control set es_in_use = true, es_current = true, elastic_index = $1`, [INDEX])
     projector = new Projector({ db, es, index: INDEX, plcUrl: 'http://127.0.0.1:1', log: () => {} })
@@ -835,7 +835,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await db.end()
   })
 
-  it('fills Postgres from index_state, compares it with today\'s index, and records verified', async () => {
+  it('fills Postgres from index_state, compares it with stored records assembled again, and records verified', async () => {
     const log: string[] = []
     const upkeep = new SearchUpkeep(db, projector, (m) => log.push(m))
     await upkeep.run()
@@ -868,7 +868,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     let row = await readControl(db)
     assert.equal(row.pgVerified, false)
     assert.deepEqual(opened, ['comparison'], 'from PR 2 a failed comparison opens an issue')
-    assert.match(row.note!, /1 only in the managed index [^ ]+ \(at:\/\/.*3ks1\)/)
+    assert.match(row.note!, /1 only in stored records assembled again \(at:\/\/.*3ks1\)/)
     assert.match(row.note!, /1 with different content \(at:\/\/.*3ks2\)/)
 
     await projector.fillPostgres(`at://${AUTHOR}/${SIDECAR}/3ks1`)
