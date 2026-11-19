@@ -10,6 +10,8 @@ export interface ControlRow {
   pgVerified: boolean
   comparedAt: Date | null
   note: string | null
+  /** The fill-and-compare version that last passed (CHECK_VERSION in verify.ts). */
+  checkedBy: number
 }
 
 const READ_EVERY_MS = 30_000
@@ -44,12 +46,13 @@ export async function readControl(db: Db): Promise<ControlRow> {
     compared_at: Date | null
     note: string | null
     stale: boolean
+    checked_by: number
   }>(
     `select g::text as generation, elastic_cursors_until,
             first_fill_done and fill_generation = g as first_fill_done,
             pg_verified and fill_generation = g as pg_verified,
             case when fill_generation = g then compared_at end as compared_at,
-            note, first_fill_done and fill_generation <> g as stale
+            note, first_fill_done and fill_generation <> g as stale, checked_by
      from search_control, search_generation_now() as g where id = 1`,
   )
   const r = res.rows[0]
@@ -59,6 +62,7 @@ export async function readControl(db: Db): Promise<ControlRow> {
     firstFillDone: r.first_fill_done,
     pgVerified: r.pg_verified,
     comparedAt: r.compared_at,
+    checkedBy: r.checked_by,
     note: r.stale ? 'ingestion tables were changed by code that does not write event_docs; filling again' : r.note,
   }
 }

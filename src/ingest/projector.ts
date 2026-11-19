@@ -74,11 +74,13 @@ export class Projector {
   }
 
   /**
-   * Writes one sidecar's current state to Postgres only, from stored records
-   * and with no fetch: the first fill (spec 5.4). index_state is left as it is.
+   * Writes one sidecar's current state, its event_docs row and its
+   * index_state row, from stored records and with no fetch: the fill (spec
+   * 5.4). A sidecar still waiting for its base event is left pending, and the
+   * ingester's retry hydrates it.
    */
-  async fillPostgres(uri: string): Promise<void> {
-    await this.projectPostgres(uri)
+  async fillSidecar(uri: string): Promise<void> {
+    await this.projectSidecars([uri], { hydrate: false })
   }
 
   /** Assembles uri from stored records and writes it to Postgres, as one step under the write lock. */

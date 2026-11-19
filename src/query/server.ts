@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { config, contractsRoot } from '../contracts/contracts.js'
 import type { Db } from '../db.js'
 import { route } from '../search/control.js'
+import { lastScaleCheck } from '../search/scale.js'
 import { todayPgP95 } from '../search/stats.js'
 import { CHECKPOINT } from '../ingest/ingester.js'
 import { readCheckpoint } from '../ingest/store.js'
@@ -121,14 +122,20 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
       pgFirstFillDone: row.firstFillDone,
       pgVerified: row.pgVerified,
       comparedAt: row.comparedAt?.toISOString() ?? null,
-      comparison: row.note,
+      comparison: publicNote(row.note),
       p95Ms: await todayPgP95(deps.db).catch(() => null),
+      scale: await lastScaleCheck(deps.db).catch(() => null),
     }
   } catch {
     out.search = { unavailable: true }
   }
   out.index = await probeNewSession(search)
   return { ...out, ...(deps.health?.() ?? {}) }
+}
+
+/** A comparison note for public health: an identifier an older version wrote into it is replaced. */
+export function publicNote(note: string | null): string | null {
+  return note && note.replace(/(at|did):[^\s,;)]+/g, '[id]')
 }
 
 /**

@@ -598,41 +598,79 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     const again = await upkeep.compare()
     assert.equal(again.ok, false)
     assert.equal((await readControl(db)).pgVerified, false)
-    await projector.postgres.put(removed)
-    assert.equal((await upkeep.compare()).ok, true)
+    // From PR 2 a difference voids the fill: the next upkeep fills again,
+    // which repairs it, and compares.
+    assert.equal((await readControl(db)).firstFillDone, false)
+    await upkeep.run()
+    assert.ok(await projector.postgres.get(removed.uri))
     assert.equal((await readControl(db)).pgVerified, true)
   })
 
-  it('names what differs, and compares again only after an hour', async () => {
+  it('names what differs, and the next upkeep fills again and repairs it', async () => {
     await db.query('update search_control set pg_verified = false, compared_at = null')
     await projector.postgres.remove(`at://${AUTHOR}/${SIDECAR}/3ks1`)
     await projector.postgres.put({ ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks2`))!, eventCid: 'bafychanged' })
-    let now = Date.now()
     const opened: string[] = []
     const log: string[] = []
-    const upkeep = new SearchUpkeep(db, projector, (m) => log.push(m), () => now, { open: async (key) => void opened.push(key) })
+    const upkeep = new SearchUpkeep(db, projector, (m) => log.push(m), Date.now, { open: async (key) => void opened.push(key) })
     await upkeep.run()
     let row = await readControl(db)
     assert.equal(row.pgVerified, false)
+    assert.equal(row.firstFillDone, false, 'a difference voids the fill')
     assert.deepEqual(opened, ['comparison'], 'from PR 2 a failed comparison opens an issue')
     // Public: counts only. The uris are in the ingester log.
     assert.match(row.note!, /1 only in stored records/)
     assert.match(row.note!, /1 with different content/)
     assert.doesNotMatch(row.note!, /at:\/\//)
     assert.ok(log.some((m) => /3ks1/.test(m) && /3ks2/.test(m)), log.join(' / '))
-
-    await projector.fillPostgres(`at://${AUTHOR}/${SIDECAR}/3ks1`)
-    await projector.fillPostgres(`at://${AUTHOR}/${SIDECAR}/3ks2`)
-    now += 30 * 60_000
-    await upkeep.run()
-    assert.equal((await readControl(db)).pgVerified, false, 'not compared again within the hour')
-    now += 31 * 60_000
     await upkeep.run()
     row = await readControl(db)
     assert.equal(row.pgVerified, true, row.note ?? '')
+    assert.equal((await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks2`))!.eventCid === 'bafychanged', false)
   })
 
-  it('fills again and compares again after code that does not write Postgres changed index_state', async () => {
+  it('fails on a stale suppression state, and the fill rewrites it', async () => {
+    const s1 = `at://${AUTHOR}/${SIDECAR}/3ks1`
+    await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now(), checked_by = 2')
+    // A complete sidecar marked incomplete: getEvent would answer it, queryEvents would drop it.
+    await db.query(`update index_state set complete = false, reason = 'orphan' where uri = $1`, [s1])
+    const upkeep = new SearchUpkeep(db, projector, () => {})
+    const res = await upkeep.compare()
+    assert.equal(res.ok, false)
+    assert.match(res.note, /1 with a stale suppression state/)
+    await upkeep.run()
+    assert.equal((await db.query('select complete from index_state where uri = $1', [s1])).rows[0].complete, true)
+    assert.equal((await readControl(db)).pgVerified, true)
+  })
+
+  it('on the first PR 2 start, fills and compares a database PR 1 verified, keeping verification meanwhile', async () => {
+    // PR 1 verified it against today's index, which missed a sidecar its
+    // index_state never recorded.
+    const s1 = `at://${AUTHOR}/${SIDECAR}/3ks1`
+    const doc = (await projector.postgres.get(s1))!
+    await projector.postgres.remove(s1)
+    await db.query('delete from index_state where uri = $1', [s1])
+    await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now(), checked_by = 0, compared_at = now()')
+    let verifiedDuringFill: boolean | undefined
+    const real = projector.fillSidecar.bind(projector)
+    projector.fillSidecar = async (uri: string) => {
+      verifiedDuringFill ??= (await readControl(db)).pgVerified
+      return real(uri)
+    }
+    try {
+      await new SearchUpkeep(db, projector, () => {}).run()
+    } finally {
+      projector.fillSidecar = real
+    }
+    assert.equal(verifiedDuringFill, true)
+    assert.deepEqual(await projector.postgres.get(s1).then((d) => d && comparable(d)), comparable(doc))
+    assert.equal((await db.query('select complete from index_state where uri = $1', [s1])).rows[0].complete, true)
+    const row = await readControl(db)
+    assert.equal(row.pgVerified, true)
+    assert.equal(row.checkedBy, 2)
+  })
+
+it('fills again and compares again after code that does not write Postgres changed index_state', async () => {
     const upkeep = new SearchUpkeep(db, projector, () => {})
     await upkeep.run()
     assert.equal((await readControl(db)).pgVerified, true)
@@ -680,6 +718,18 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     await db.query(`update accounts set active = true where did = '${AUTHOR}'`)
     await db.query('update search_control set compared_at = null')
     await upkeep.run()
+    assert.equal((await readControl(db)).pgVerified, true)
+  })
+
+  it('clears verification when any connection truncates an ingestion table', async () => {
+    await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now()')
+    await db.query('create table keep_state as select * from index_state')
+    await db.query('truncate index_state')
+    assert.equal((await readControl(db)).pgVerified, false)
+    await db.query('insert into index_state select * from keep_state')
+    await db.query('drop table keep_state')
+    await db.query('update search_control set compared_at = null')
+    await new SearchUpkeep(db, projector, () => {}).run()
     assert.equal((await readControl(db)).pgVerified, true)
   })
 
@@ -740,7 +790,7 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     await holder.query('select pg_advisory_xact_lock($1)', [7140015])
     let fill: Promise<void> | undefined
     try {
-      fill = projector.fillPostgres(s3)
+      fill = projector.fillSidecar(s3)
       // Barrier: the fill is waiting on the write lock.
       for (let i = 0; ; i++) {
         const waiting = await db.query(`select 1 from pg_locks where locktype = 'advisory' and objid = 7140015 and not granted`)
@@ -878,7 +928,7 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     }
 
     await db.query('update records set deleted = false, value = $2 where uri = $1', [s1, stored])
-    await projector.fillPostgres(s1)
+    await projector.fillSidecar(s1)
     await db.query('update search_control set pg_verified = false, compared_at = null')
     await new SearchUpkeep(db, projector, () => {}).run()
     assert.equal((await readControl(db)).pgVerified, true)
@@ -918,6 +968,7 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     assert.equal((await readControl(db)).pgVerified, true)
     await projector.postgres.remove(s9)
     await db.query(`delete from records where uri in ($1, $2)`, [s9, `at://${AUTHOR}/${EVENT}/3ke9`])
+    await db.query('delete from index_state where uri = $1', [s9])
     await db.query('update search_control set fill_generation = search_generation_now(), compared_at = null')
   })
 

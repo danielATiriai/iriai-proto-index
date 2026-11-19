@@ -156,6 +156,16 @@ create table if not exists search_control (
   -- and verification count only while the generation has not moved since.
   fill_generation bigint not null default 0
 );
+-- PR 2: the fill-and-compare version that last passed (CHECK_VERSION in
+-- src/search/verify.ts); a lower one is filled and compared again once.
+-- Only when missing, as for accounts.needs_rebuild.
+do $do$
+begin
+  if not exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'search_control' and column_name = 'checked_by') then
+    alter table search_control add column checked_by integer not null default 0;
+  end if;
+end
+$do$;
 -- Moved on by every change to an ingestion table from code that does not
 -- write event_docs. A sequence, not a row: it takes no lock (so the trigger
 -- cannot deadlock writers with one another) and does not roll back.
@@ -184,6 +194,12 @@ begin
   return null;
 end
 $fn$;
+create or replace function search_truncate() returns trigger language plpgsql as $fn$
+begin
+  perform nextval('search_generation');
+  return null;
+end
+$fn$;
 -- Created only when missing: replacing a trigger locks its table
 -- exclusively, which an older writer mid-transaction would have to wait for. Tables are taken in the order the
 -- ingester writes them (records, accounts, index_state), as everywhere in
@@ -194,6 +210,13 @@ begin
   foreach t in array array['records', 'accounts', 'index_state', 'checkpoints', 'skipped_events'] loop
     if not exists (select 1 from pg_trigger where tgname = t || '_foreign_write' and tgrelid = t::regclass) then
       execute format('create trigger %I after insert or update or delete on %I for each statement execute function search_foreign_write()', t || '_foreign_write', t);
+    end if;
+  end loop;
+  -- PR 2: TRUNCATE moves the generation too, from any connection, this code's
+  -- included (nothing here truncates). Only when missing, as above.
+  foreach t in array array['records', 'accounts', 'index_state'] loop
+    if not exists (select 1 from pg_trigger where tgname = t || '_foreign_truncate' and tgrelid = t::regclass) then
+      execute format('create trigger %I after truncate on %I for each statement execute function search_truncate()', t || '_foreign_truncate', t);
     end if;
   end loop;
 end
@@ -218,6 +241,14 @@ $fn$;
 
 -- When each kind of GitHub issue was last delivered, so one cause opens at
 -- most one issue a day.
+-- The ingester's last scale check, for the query service's health.
+create table if not exists search_scale (
+  id integer primary key check (id = 1),
+  checked_at timestamptz not null,
+  events bigint not null,
+  trigger_reason text
+);
+
 create table if not exists search_alerts (
   key text primary key,
   opened_at timestamptz not null

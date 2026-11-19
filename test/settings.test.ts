@@ -25,4 +25,9 @@ describe('settings', () => {
     assert.throws(() => loadSettings({ ...base, ROLE: 'indexer' }), /ROLE/)
     assert.throws(() => loadSettings({ ROLE: 'ingester' }), /DATABASE_URL/)
   })
+
+  it('takes a p95 threshold only on a histogram bucket edge', () => {
+    assert.equal(loadSettings({ ...base, ROLE: 'ingester', SEARCH_ON_P95_MS: '300' }).thresholds.onP95Ms, 300)
+    assert.throws(() => loadSettings({ ...base, ROLE: 'ingester', SEARCH_ON_P95_MS: '255' }), /bucket edge/)
+  })
 })

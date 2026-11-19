@@ -34,6 +34,11 @@ export class ScaleCheck {
       await recordEvents(this.db, events)
       const why = await this.onReason(events)
       this.last = { at: new Date().toISOString(), events, trigger: why ?? null }
+      await this.db.query(
+        `insert into search_scale (id, checked_at, events, trigger_reason) values (1, now(), $1, $2)
+         on conflict (id) do update set checked_at = excluded.checked_at, events = excluded.events, trigger_reason = excluded.trigger_reason`,
+        [events, why ?? null],
+      )
       this.unverified = (await readControl(this.db)).pgVerified ? 0 : this.unverified + 1
       if (this.unverified >= UNVERIFIED_CHECKS) {
         await this.issues.open(
@@ -63,4 +68,10 @@ export class ScaleCheck {
     if (slow) return `on ${ON_DAYS} consecutive days with at least ${t.onMinCalls} calls, Postgres p95 at least ${t.onP95Ms} ms or over ${t.onTimeoutRate * 100}% timeouts`
     return undefined
   }
+}
+
+/** The last scale check any ingester recorded, for health; null before the first. */
+export async function lastScaleCheck(db: Db): Promise<{ at: string; events: number; trigger: string | null } | null> {
+  const r = (await db.query<{ checked_at: Date; events: string; trigger_reason: string | null }>('select checked_at, events, trigger_reason from search_scale where id = 1')).rows[0]
+  return r ? { at: r.checked_at.toISOString(), events: Number(r.events), trigger: r.trigger_reason } : null
 }

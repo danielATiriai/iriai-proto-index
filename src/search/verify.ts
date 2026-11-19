@@ -6,6 +6,14 @@ import { readControl } from './control.js'
 import type { Issues } from './issues.js'
 
 const COMPARE_EVERY_MS = 60 * 60_000
+/**
+ * The version of the fill-and-compare rule. A database whose recorded
+ * version is lower (PR 1 verified it against today's index, enumerating only
+ * index_state) is filled and compared again once at start, keeping its
+ * verification while the fill runs, since the fill only writes what stored
+ * records assemble to.
+ */
+export const CHECK_VERSION = 2
 const LISTED = 5
 /** Held by the ingester running upkeep. */
 export const UPKEEP_LOCK = 7140016
@@ -19,9 +27,11 @@ export const SETTLE_MS = 30_000
  * reads stored records under the write lock, and a write from code that does
  * not keep event_docs moves the generation, which voids the run. Closed rows
  * past 61 minutes are deleted; the first fill runs until it finishes at an
- * unmoved generation; then the comparison runs right after it and hourly
- * until it passes. Verification holds until a comparison finds a difference
- * or the generation moves.
+ * unmoved generation; then the comparison runs right after it. A comparison
+ * that finds a difference voids the fill, so the next upkeep fills again
+ * (which repairs it) and compares; one that could not run is retried hourly.
+ * Verification holds until a comparison finds a difference or the generation
+ * moves.
  */
 export class SearchUpkeep {
   settleMs = SETTLE_MS
@@ -94,6 +104,14 @@ export class SearchUpkeep {
       }
       // The fill cleared verification and the last comparison: compare now,
       // not by the row read before the fill.
+    } else if (row.checkedBy < CHECK_VERSION) {
+      try {
+        const n = await this.fill()
+        this.log(`search: filled ${n} sidecars again for the version ${CHECK_VERSION} check`)
+      } catch (err) {
+        this.log(`search: the version ${CHECK_VERSION} fill failed, retrying in 10 minutes: ${(err as Error).message}`)
+        return
+      }
     } else {
       if (row.pgVerified) return
       if (row.comparedAt && this.now() - row.comparedAt.getTime() < COMPARE_EVERY_MS) return
@@ -115,14 +133,20 @@ export class SearchUpkeep {
   async firstFill(): Promise<number> {
     const { generation } = await readControl(this.db)
     await this.settle()
-    const uris = await expectedSidecars(this.db)
-    for (const uri of uris) await this.projector.fillPostgres(uri)
+    const n = await this.fill()
     const res = await (this.publisher ?? this.db).query(
       `update search_control set first_fill_done = true, fill_generation = $1, pg_verified = false, compared_at = null, note = null, updated_at = now()
        where id = 1 and search_generation_now() = $1`,
       [generation],
     )
     if (res.rowCount === 0) throw new Error('an ingestion table changed during the fill')
+    return n
+  }
+
+  /** Projects every sidecar, its event_docs row and its index_state row, from stored records. */
+  private async fill(): Promise<number> {
+    const uris = await expectedSidecars(this.db)
+    for (const uri of uris) await this.projector.fillSidecar(uri)
     return uris.length
   }
 
@@ -131,12 +155,15 @@ export class SearchUpkeep {
    * versions, and not indexedAt) with every sidecar assembled again from the
    * stored records, both read in one snapshot. From PR 2 today's index is not
    * written, so it is no longer the copy. The sidecars are enumerated from
-   * records, index_state and event_docs together. A uri that differs in the
-   * snapshot is read again once, in a fresh snapshot, so a write that landed
-   * between the two tables does not fail the check. The result is recorded
+   * records, index_state and event_docs together, and index_state's
+   * suppression is checked too. When anything differs the whole comparison
+   * runs again in a fresh snapshot, and only that second run counts, so a
+   * write that landed between the tables does not fail the check and a
+   * partial re-read cannot pass it. The result is recorded
    * only if the fill is done and the generation has not moved since the
-   * comparison began: a pass sets pg_verified and a comparison that finds a
-   * difference clears it; one that could not run changes nothing. The note
+   * comparison began: a pass sets pg_verified and checked_by; a comparison
+   * that finds a difference clears pg_verified and first_fill_done; one that
+   * could not run changes nothing. The note
    * (public in health and in the issue) has counts only; the uris go to the
    * ingester log.
    */
@@ -146,8 +173,11 @@ export class SearchUpkeep {
     let note: string
     const { generation } = await readControl(this.db)
     try {
+      // A difference may be a write landing between tables mid-read: the
+      // whole comparison runs once more in a fresh snapshot, and only a clean
+      // second run passes.
       let found = await this.differences()
-      if (found.total > 0) found = await this.differences(found.uris)
+      if (found.total > 0) found = await this.differences()
       ran = true
       ok = found.total === 0
       note = ok
@@ -156,13 +186,15 @@ export class SearchUpkeep {
             found.missing.length && `${found.missing.length} only in stored records`,
             found.extra.length && `${found.extra.length} only in Postgres`,
             found.differ.length && `${found.differ.length} with different content`,
+            found.state.length && `${found.state.length} with a stale suppression state`,
           ]
             .filter(Boolean)
             .join('; ')
       if (!ok) {
         this.log(
           `search: comparison differences: only in stored records ${found.missing.slice(0, LISTED).join(', ')}; ` +
-            `only in Postgres ${found.extra.slice(0, LISTED).join(', ')}; different ${found.differ.slice(0, LISTED).join(', ')}`,
+            `only in Postgres ${found.extra.slice(0, LISTED).join(', ')}; different ${found.differ.slice(0, LISTED).join(', ')}; ` +
+            `stale state ${found.state.slice(0, LISTED).join(', ')}`,
         )
       }
     } catch (err) {
@@ -173,42 +205,58 @@ export class SearchUpkeep {
     const res = await (this.publisher ?? this.db).query(
       `update search_control
          set pg_verified = case when $4 then $1 else pg_verified end,
-             compared_at = case when $4 then now() else compared_at end, note = $2, updated_at = now()
+             compared_at = case when $4 then now() else compared_at end, note = $2, updated_at = now(),
+             checked_by = case when $4 and $1 then greatest(checked_by, ${CHECK_VERSION}) else checked_by end,
+             -- A difference voids the fill: the next upkeep fills again, which repairs it.
+             first_fill_done = case when $4 and not $1 then false else first_fill_done end
        where id = 1 and first_fill_done and fill_generation = $3 and search_generation_now() = $3`,
       [ok, note, generation, ran],
     )
     if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }
     if (ran && !ok) {
       await this.issues
-        ?.open('comparison', 'Search: the Postgres comparison did not pass', `Postgres is not verified, so search answers 503; upkeep compares again hourly. ${note}.`)
+        ?.open('comparison', 'Search: the Postgres comparison did not pass', `Postgres is not verified, so search answers 503; the next upkeep (within 10 minutes) fills from stored records again and compares. ${note}.`)
         .catch((err) => this.log(`search: could not open the comparison issue: ${(err as Error).message}`))
     }
     return { ok, note }
   }
 
-  /** Postgres against stored records in one read-only snapshot, for every sidecar or only `only`. */
-  private async differences(only?: string[]) {
+  /**
+   * Postgres's documents and suppression state against stored records, in
+   * one read-only snapshot. A sidecar with a stored record needs an
+   * index_state row whose `complete` matches its assembly; one without needs
+   * none, or one that suppresses.
+   */
+  private async differences() {
     const client = await checkout(this.db)
     try {
       await client.query('begin isolation level repeatable read read only')
       const q = client as unknown as Db
       const rows = (
         await q.query<{ uri: string; doc: EventDoc }>(
-          `select uri, doc from event_docs where closed_version is null${only ? ' and uri = any($1)' : ''}`,
-          only ? [only] : [],
+          `select uri, doc from event_docs where closed_version is null`,
         )
       ).rows
       const pg = new Map(rows.map((r) => [r.uri, r.doc]))
+      const states = new Map(
+        (await q.query<{ uri: string; complete: boolean }>('select uri, complete from index_state')).rows.map((r) => [r.uri, r.complete]),
+      )
+      const recorded = new Set(
+        (await q.query<{ uri: string }>('select uri from records where collection = $1', [eventSidecarNsid])).rows.map((r) => r.uri),
+      )
       const stored = new Map<string, EventDoc>()
-      for (const uri of only ?? (await expectedSidecars(q))) {
+      const state: string[] = []
+      for (const uri of await expectedSidecars(q)) {
         const doc = await this.projector.assembled(uri, q)
         if (doc) stored.set(uri, doc)
+        const s = states.get(uri)
+        if (recorded.has(uri) ? s !== !!doc : s === true) state.push(uri)
       }
       await client.query('commit')
       const missing = [...stored.keys()].filter((uri) => !pg.has(uri))
       const extra = [...pg.keys()].filter((uri) => !stored.has(uri))
       const differ = [...pg.keys()].filter((uri) => stored.has(uri) && comparable(pg.get(uri)!) !== comparable(stored.get(uri)!))
-      return { size: pg.size, missing, extra, differ, uris: [...missing, ...extra, ...differ], total: missing.length + extra.length + differ.length }
+      return { size: pg.size, missing, extra, differ, state, total: missing.length + extra.length + differ.length + state.length }
     } catch (err) {
       await client.query('rollback').catch(() => {})
       throw err

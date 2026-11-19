@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import type { Db } from '../src/db.js'
 import { DEFAULT_THRESHOLDS } from '../src/settings.js'
 import { GitHubIssues, type Issues } from '../src/search/issues.js'
-import { ScaleCheck } from '../src/search/scale.js'
+import { ScaleCheck, lastScaleCheck } from '../src/search/scale.js'
 import { BUCKETS_MS, SearchStats, addStats, bucketOf, isTimeout, lastDays, p95 } from '../src/search/stats.js'
 import { databaseUrl, freshDb } from './support.js'
 
@@ -112,6 +112,32 @@ describe('GitHub issues', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' },
     await new GitHubIssues(db, 'token', 'o/r', () => {}, fake(sent)).open('k', 'title', 'body')
     assert.deepEqual(sent, ['title', 'title'])
   })
+
+  it('holds a cause only for a short lease until GitHub accepts it, then for a day', async () => {
+    // A process that stopped between the claim and the request leaves a lease that lapses.
+    await db.query(`insert into search_alerts (key, opened_at) values ('k', now() - interval '23 hours' + interval '5 minutes')`)
+    await db.query(`update search_alerts set opened_at = opened_at - interval '6 minutes'`)
+    const sent: string[] = []
+    await new GitHubIssues(db, 'token', 'o/r', () => {}, fake(sent)).open('k', 'title', 'body')
+    const { rows } = await db.query<{ fresh: boolean }>(`select opened_at > now() - interval '1 minute' as fresh from search_alerts where key = 'k'`)
+    assert.deepEqual([sent, rows[0].fresh], [['title'], true])
+  })
+
+  it('never sends or logs a malformed token, and logs only a status or an error kind', async () => {
+    const secret = 'ghp_SENTINEL\nvalue'
+    const logs: string[] = []
+    const sent: string[] = []
+    await new GitHubIssues(db, secret, 'o/r', (m) => logs.push(m), fake(sent)).open('k', 'title', 'body')
+    assert.deepEqual(sent, [])
+    const thrower = (async () => {
+      throw new TypeError('Invalid header value: "Bearer ghp_SENTINEL"')
+    }) as unknown as typeof fetch
+    await new GitHubIssues(db, 'ghp_SENTINEL', 'o/r', (m) => logs.push(m), thrower).open('k2', 'title', 'body')
+    assert.ok(logs.length >= 2)
+    for (const line of logs) assert.doesNotMatch(line, /SENTINEL/)
+    assert.match(logs[0], /malformed/)
+    assert.match(logs[1], /request failed: TypeError/)
+  })
 })
 
 describe('the scale check (spec 6.2)', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () => {
@@ -133,6 +159,8 @@ describe('the scale check (spec 6.2)', { skip: !databaseUrl && 'TEST_DATABASE_UR
     assert.match(check.last!.trigger!, /0 events/)
     const today = await db.query<{ events: string }>(`select events::text from search_stats where day = (now() at time zone 'utc')::date`)
     assert.equal(today.rows[0].events, '0')
+    // Recorded for the query service's health, which runs in another process.
+    assert.deepEqual(await lastScaleCheck(db).then((r) => r && [r.events, r.trigger]), [0, check.last!.trigger])
     opened = []
     await new ScaleCheck(db, DEFAULT_THRESHOLDS, issues, () => {}).tick()
     assert.deepEqual(opened, [])

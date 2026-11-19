@@ -10,6 +10,7 @@ The other option was "Keep the full controller". Why: every blocker in the revie
 
 ## What changes in spec.md (v14, build 5e80472) for PR 2
 
+- **3.** Every Elasticsearch cursor answers `CursorExpired` at once, `elastic_cursors_until` notwithstanding: Elasticsearch is not written, so its snapshot is stale, and sending a cursor there would wake it. None has been issued since Nov 17 (`SEARCH_BACKEND_FORCE=postgres`), so all are past their hour.
 - **5.1, 5.2.** Elasticsearch is not written, read or contacted, and there is no managed index or `es_pending`. Postgres serves once verified, else `ServiceUnavailable`. "Until Postgres is verified, Elasticsearch serves alone" no longer applies, so PR 2 deploys only while health shows `search.pgVerified: true`. The verifying comparison checks Postgres against sidecars assembled again from stored records, not today's index.
 - **5.3.** Health drops `esInUse`, `esCurrent` and `state`, shows `elastic: "off"`, and adds the scale check's last result.
 - **5.4.** Code does not delete today's index. It goes when Daniel removes the Railway Elasticsearch service.

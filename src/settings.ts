@@ -1,3 +1,4 @@
+import { BUCKETS_MS } from './search/stats.js'
 /** events.iriai.app, the steward account that publishes the seed events (BUILD-006). */
 export const STEWARD_DID = 'did:plc:kd5s7zyp7nje43ievnqhgzrr'
 
@@ -61,11 +62,17 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
     githubAlertRepo: env.GITHUB_ALERT_REPO ?? 'danielATiriai/iriai-proto-index',
     thresholds: {
       onMinCalls: num(env, 'SEARCH_ON_MIN_CALLS', DEFAULT_THRESHOLDS.onMinCalls),
-      onP95Ms: num(env, 'SEARCH_ON_P95_MS', DEFAULT_THRESHOLDS.onP95Ms),
+      onP95Ms: edge(num(env, 'SEARCH_ON_P95_MS', DEFAULT_THRESHOLDS.onP95Ms)),
       onTimeoutRate: num(env, 'SEARCH_ON_TIMEOUT_RATE', DEFAULT_THRESHOLDS.onTimeoutRate),
       onEvents: num(env, 'SEARCH_ON_EVENTS', DEFAULT_THRESHOLDS.onEvents),
     },
   }
+}
+
+/** The p95 threshold must be a histogram bucket edge, so the check reads it exactly. */
+function edge(ms: number): number {
+  if (!BUCKETS_MS.includes(ms)) throw new Error(`SEARCH_ON_P95_MS must be a histogram bucket edge (a multiple of 10 up to 500, or of 50 up to 2000), not ${ms}`)
+  return ms
 }
 
 function num(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
