@@ -169,11 +169,16 @@ $fn$;
 -- stale. Any such change moves the generation on, which voids the first
 -- fill and verification, so the next upkeep fills event_docs again and
 -- compares before Postgres may serve.
--- Every table the ingester writes is watched, not only index_state: older
--- code changes records or accounts first and may fail before index_state.
+-- Every table event_docs is built from is watched, not only index_state:
+-- older code changes records or accounts first and may fail before
+-- index_state. checkpoints and skipped_events still carry PR 1's triggers
+-- but no longer move it: neither feeds event_docs, and since PR 2 a moved
+-- generation means 503s until upkeep fills again, so clearing skipped
+-- events by hand must not cause one. (A function change takes no table lock.)
 create or replace function search_foreign_write() returns trigger language plpgsql as $fn$
 begin
-  if coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
+  if TG_TABLE_NAME not in ('checkpoints', 'skipped_events')
+     and coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
     perform nextval('search_generation');
   end if;
   return null;

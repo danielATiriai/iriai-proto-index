@@ -683,6 +683,24 @@ describe('first fill and the verifying comparison', { skip: !databaseUrl && 'TES
     assert.equal((await readControl(db)).pgVerified, true)
   })
 
+  it('keeps verification when a plain connection changes checkpoints or skipped_events, which do not feed event_docs', async () => {
+    await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now()')
+    const before = (await readControl(db)).generation
+    const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+    await old.connect()
+    try {
+      await old.query(`insert into skipped_events (time_us, did, kind, event, attempts) values (1, 'did:plc:x', 'commit', '{}', 3)`)
+      await old.query('delete from skipped_events where time_us = 1')
+      await old.query(`insert into checkpoints (name, cursor) values ('manual-test', 1) on conflict (name) do update set cursor = 1`)
+      await old.query(`delete from checkpoints where name = 'manual-test'`)
+    } finally {
+      await old.end()
+    }
+    const row = await readControl(db)
+    assert.equal(row.generation, before)
+    assert.equal(row.pgVerified, true)
+  })
+
   it('does not verify when index_state changes from old code while the comparison runs', async () => {
     await db.query('update search_control set pg_verified = false, compared_at = null')
     const upkeep = new SearchUpkeep(db, projector, () => {})

@@ -53,6 +53,26 @@ describe('search stats (spec 6.1)', { skip: !databaseUrl && 'TEST_DATABASE_URL n
     const today = await db.query<{ calls: string; pg_timeouts: string }>(`select calls::text, pg_timeouts::text from search_stats where day = (now() at time zone 'utc')::date`)
     assert.deepEqual(today.rows[0], { calls: '1', pg_timeouts: '1' })
   })
+
+  it('keeps a day whose flush failed at midnight, and writes it at the next flush', async () => {
+    await db.query('delete from search_stats')
+    let fail = true
+    const flaky = { query: (text: string, values: unknown[]) => (fail ? Promise.reject(new Error('down')) : db.query(text, values)) } as unknown as Db
+    const stats = new SearchStats(flaky, () => {})
+    stats.call()
+    stats.call()
+    // The counts are yesterday's; the next call rolls the day, and that flush fails.
+    ;(stats as unknown as { day: string }).day = day(1)
+    stats.call()
+    await new Promise((r) => setImmediate(r))
+    fail = false
+    await stats.flush()
+    const rows = await db.query<{ day: string; calls: string }>(`select day::text, calls::text from search_stats order by day`)
+    assert.deepEqual(rows.rows, [
+      { day: day(1), calls: '2' },
+      { day: day(0), calls: '1' },
+    ])
+  })
 })
 
 describe('GitHub issues', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () => {

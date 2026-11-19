@@ -125,9 +125,9 @@ export async function queryEvents(deps: QueryDeps, q: EventQuery, now = Date.now
 
   if (q.cursor) {
     const state = decodeCursor(q.cursor, deps.cursorKey, expect, now)
-    // Cursors from before the backend field are Elasticsearch's. Elasticsearch
-    // has issued none since Nov 17 (SEARCH_BACKEND_FORCE=postgres), so every
-    // one is past its hour; it is never sent there, which would wake it.
+    // Cursors from before the backend field are Elasticsearch's. Every one
+    // expires here: Elasticsearch is not written, so its snapshot is stale,
+    // and it is never sent there, which would wake it.
     if ((state.be ?? 'elastic') !== 'postgres') throw new CursorError('CursorExpired', 'the paging snapshot has expired; restart without a cursor')
     backend = search.postgres
     created = state.created

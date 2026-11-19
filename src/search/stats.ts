@@ -82,21 +82,36 @@ export class SearchStats {
   }
 
   async flush(): Promise<void> {
+    // An earlier day whose flush failed is written first.
+    const carried = this.carried.splice(0)
+    for (let i = 0; i < carried.length; i++) {
+      try {
+        await addStats(this.db, carried[i])
+      } catch (err) {
+        this.carried.unshift(...carried.slice(i))
+        throw err
+      }
+    }
     const out = { day: this.day, calls: this.calls, pg: this.pg, pgTimeouts: this.pgTimeouts }
     if (out.calls === 0 && out.pg.every((n) => n === 0)) return
     this.reset(this.day)
     try {
       await addStats(this.db, out)
     } catch (err) {
-      // Put the counts back for the next flush.
+      // Put the counts back for the next flush: into today's, or carried when the day has rolled since.
       if (out.day === this.day) {
         this.calls += out.calls
         out.pg.forEach((n, i) => (this.pg[i] += n))
         this.pgTimeouts += out.pgTimeouts
+      } else {
+        this.carried.push(out)
       }
       throw err
     }
   }
+
+  /** Counts of earlier days that could not be written yet. */
+  private carried: { day: string; calls: number; pg: number[]; pgTimeouts: number }[] = []
 
   private roll(): void {
     const today = utcDay()
@@ -173,11 +188,11 @@ export async function lastDays(db: Db, n: number): Promise<DayStats[]> {
   })
 }
 
-/** Today's Postgres p95 so far (the upper bound of its bucket), for health. */
+/** Today's Postgres p95 so far, for health: the lower bound of its bucket (the 2 s and over bucket reads 2000). */
 export async function todayPgP95(db: Db): Promise<number | null> {
   const res = await db.query<{ pg_hist: string[] }>(`select pg_hist from search_stats where day = (now() at time zone 'utc')::date`)
   const p = res.rows[0] ? p95(res.rows[0].pg_hist) : undefined
-  return p ? p.upper : null
+  return p ? p.lower : null
 }
 
 /** Keeps rows 90 days (spec 6.1). */
