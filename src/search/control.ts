@@ -10,7 +10,20 @@ export interface ControlRow {
   pgVerified: boolean
   comparedAt: Date | null
   note: string | null
+  /** The controller's state (spec 6.4). */
+  state: ControllerState
+  since: Date
+  esInUse: boolean
+  esCurrent: boolean
+  elasticIndex: string | null
+  /** An es_pending row is older than 2 seconds: the managed index may not serve (spec 5.2). */
+  pendingStale: boolean
+  esSeenAt: Date | null
+  disabled: boolean
+  controllerNote: string | null
 }
+
+export type ControllerState = 'off' | 'ready' | 'starting' | 'backfilling' | 'verifying' | 'on' | 'draining'
 
 const READ_EVERY_MS = 30_000
 /**
@@ -48,12 +61,23 @@ export async function readControl(db: Db): Promise<ControlRow> {
     compared_at: Date | null
     note: string | null
     stale: boolean
+    state: ControllerState
+    since: Date
+    es_in_use: boolean
+    es_current: boolean
+    elastic_index: string | null
+    pending_stale: boolean
+    es_seen_at: Date | null
+    disabled: boolean
+    controller_note: string | null
   }>(
     `select g::text as generation, elastic_cursors_until,
             first_fill_done and fill_generation = g as first_fill_done,
             pg_verified and fill_generation = g as pg_verified,
             case when fill_generation = g then compared_at end as compared_at,
-            note, first_fill_done and fill_generation <> g as stale
+            note, first_fill_done and fill_generation <> g as stale,
+            state, since, es_in_use, es_current, elastic_index, es_seen_at, disabled, controller_note,
+            exists (select 1 from es_pending where at < clock_timestamp() - interval '2 seconds') as pending_stale
      from search_control, search_generation_now() as g where id = 1`,
   )
   const r = res.rows[0]
@@ -64,6 +88,15 @@ export async function readControl(db: Db): Promise<ControlRow> {
     pgVerified: r.pg_verified,
     comparedAt: r.compared_at,
     note: r.stale ? 'ingestion tables were changed by code that does not write event_docs; filling again' : r.note,
+    state: r.state,
+    since: r.since,
+    esInUse: r.es_in_use,
+    esCurrent: r.es_current,
+    elasticIndex: r.elastic_index,
+    pendingStale: r.pending_stale,
+    esSeenAt: r.es_seen_at,
+    disabled: r.disabled,
+    controllerNote: r.controller_note,
   }
 }
 
@@ -174,14 +207,28 @@ export interface Route {
   reason: string
 }
 
+export type RouteRow = Pick<ControlRow, 'pgVerified' | 'state' | 'esInUse' | 'esCurrent' | 'elasticIndex' | 'pendingStale'>
+
 /**
- * The rule of spec 5.2 for a new session, as PR 1 has it: the chosen backend
- * (SEARCH_BACKEND_FORCE, default elastic) if it may serve, else Postgres if
- * verified, else nothing. Today's index may serve throughout PR 1, since it is
- * written as before; Postgres may serve once verified.
+ * Whether the managed index may serve a new session (spec 5.2): Elasticsearch
+ * is in use, the index named holds every current row, and no write it has not
+ * confirmed is older than 2 seconds. Today's index never serves from PR 2.
  */
-export function route(force: BackendName, row: Pick<ControlRow, 'pgVerified'>): Route | undefined {
-  if (force === 'elastic') return { backend: 'elastic', reason: 'SEARCH_BACKEND_FORCE=elastic (default)' }
-  if (row.pgVerified) return { backend: 'postgres', reason: 'SEARCH_BACKEND_FORCE=postgres, Postgres verified' }
+export function elasticMayServe(row: RouteRow): boolean {
+  return row.esInUse && row.esCurrent && !!row.elasticIndex && !row.pendingStale
+}
+
+/**
+ * The rule of spec 5.2 for a new session: the chosen backend (SEARCH_BACKEND_FORCE,
+ * else Elasticsearch in the controller's state on, else Postgres) if it may
+ * serve, else Postgres if verified, else nothing.
+ */
+export function route(force: BackendName | undefined, row: RouteRow): Route | undefined {
+  const chosen: BackendName = force ?? (row.state === 'on' ? 'elastic' : 'postgres')
+  const why = force ? `SEARCH_BACKEND_FORCE=${force}` : `controller state ${row.state}`
+  if (chosen === 'elastic' && elasticMayServe(row)) return { backend: 'elastic', reason: `${why}; the managed index may serve` }
+  if (row.pgVerified) {
+    return { backend: 'postgres', reason: chosen === 'postgres' ? `${why}; Postgres verified` : `${why}, but the managed index may not serve; Postgres verified` }
+  }
   return undefined
 }

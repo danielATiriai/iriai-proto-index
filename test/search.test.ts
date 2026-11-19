@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 import { migrate, searchWriterSeen, type Db } from '../src/db.js'
 import type { EventDoc } from '../src/index/assemble.js'
-import { ElasticBackend, connectElastic, ensureIndex, type Elastic } from '../src/index/elastic.js'
+import { ElasticBackend, connectElastic, createManagedIndex, ensureIndex, putManaged, removeManaged, type Elastic } from '../src/index/elastic.js'
 import { Handler, type JetstreamEvent } from '../src/ingest/handler.js'
 import { Projector } from '../src/ingest/projector.js'
 import { incompleteAmong, setIndexState } from '../src/ingest/store.js'
@@ -264,6 +264,8 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
       await setIndexState(db, uriOf(n), AUTHOR, true, null)
     }
     await es.indices.refresh({ index: INDEX })
+    // INDEX plays the current managed index (spec 5.2): in use, current, nothing pending.
+    await db.query(`update search_control set es_in_use = true, es_current = true, elastic_index = $1`, [INDEX])
     search = { elastic, postgres, control: new SearchControl(db), force: 'elastic' }
     deps = { db, search, serviceId: 'test', cursorKey: randomBytes(32) }
   })
@@ -377,10 +379,9 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     assert.ok(compared >= 90, `${compared} combinations`)
   })
 
-  it('keeps serving getEvent from Elasticsearch when search_control cannot be read', async () => {
+  it('refuses getEvent when search_control cannot be read: neither backend can be shown to may serve', async () => {
     const broken = { current: async () => Promise.reject(new Error('connect ECONNREFUSED')), refresh: async () => Promise.reject(new Error('down')) } as unknown as SearchControl
-    const res = await getEvent({ ...deps, search: { ...search, control: broken } }, uriOf(2))
-    assert.equal(res.value.uri, uriOf(2))
+    await assert.rejects(getEvent({ ...deps, search: { ...search, control: broken } }, uriOf(2)), unavailable)
   })
 
   /** search_control on a database whose every query stalls (or answers after `ms`). */
@@ -390,10 +391,9 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
         ms === Infinity ? new Promise(() => {}) : new Promise((r) => setTimeout(r, ms)).then(() => db.query(text, values)),
     } as unknown as Db)
 
-  it('cuts off a stalled search_control read after 500 ms and serves getEvent from Elasticsearch', async () => {
+  it('cuts off a stalled search_control read after 500 ms and refuses getEvent rather than hanging', async () => {
     const started = Date.now()
-    const res = await getEvent({ ...deps, search: { ...search, control: slowControl() } }, uriOf(2))
-    assert.equal(res.value.uri, uriOf(2))
+    await assert.rejects(getEvent({ ...deps, search: { ...search, control: slowControl() } }, uriOf(2)), unavailable)
     assert.ok(Date.now() - started < 1_500, `took ${Date.now() - started} ms`)
   })
 
@@ -419,11 +419,22 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     }
   })
 
-  it('falls back to a verified Postgres for getEvent when today\'s index does not exist', async () => {
+  /** Names a managed index that does not exist in search_control while `fn` runs. */
+  const withMissingIndex = async (fn: () => Promise<void>) => {
+    await db.query(`update search_control set elastic_index = $1`, [`${INDEX}-missing`])
+    try {
+      await fn()
+    } finally {
+      await db.query(`update search_control set elastic_index = $1`, [INDEX])
+    }
+  }
+
+  it('falls back to a verified Postgres for getEvent when the managed index does not exist', async () => {
     await setVerified(true)
-    const missing = new ElasticBackend(es, `${INDEX}-missing`)
-    const res = await getEvent({ ...deps, search: { ...search, elastic: missing } }, uriOf(2))
-    assert.equal(res.value.uri, uriOf(2))
+    await withMissingIndex(async () => {
+      const res = await getEvent(deps, uriOf(2))
+      assert.equal(res.value.uri, uriOf(2))
+    })
   })
 
   it('reports a slow Elasticsearch in health as before while Postgres is not verified', async () => {
@@ -463,10 +474,9 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     await setVerified(true)
   })
 
-  it('answers ServiceUnavailable, not an error, when today\'s index does not exist yet', async () => {
+  it('answers ServiceUnavailable, not an error, when the managed index does not exist', async () => {
     await setVerified(false)
-    const missing = new ElasticBackend(es, `${INDEX}-missing`)
-    await assert.rejects(ask(PARAMS, undefined, { ...deps, search: { ...search, elastic: missing } }), unavailable)
+    await withMissingIndex(() => assert.rejects(ask(PARAMS), unavailable))
     await setVerified(true)
   })
 
@@ -545,17 +555,15 @@ describe('search routing', { skip: (!databaseUrl || !elasticUrl) && 'TEST_DATABA
     }
   }
 
-  it('agrees with a first page in health when a cached cover lets Elasticsearch serve while search_control fails', async () => {
+  it('agrees with a first page in health when search_control fails, even with a cached cover', async () => {
     const control = new SearchControl(db)
     await control.coverElasticSession()
-    // From now on every read fails; the cached cover still holds.
+    // From now on every read fails: whether the managed index may serve cannot be read.
     control.refresh = async () => Promise.reject(new Error('down'))
     const s = { ...search, control }
-    const page = await ask(PARAMS, undefined, { ...deps, search: s })
-    assert.ok(page.events.length > 0)
+    await assert.rejects(ask(PARAMS, undefined, { ...deps, search: s }), unavailable)
     const index = await healthIndex(s)
-    assert.equal(index.ok, true)
-    assert.equal(index.backend, 'elastic')
+    assert.equal(index.ok, false)
   })
 
   it('agrees with a first page in health when verification is cleared during a failing Elasticsearch attempt', async () => {
@@ -809,15 +817,18 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
   before(async () => {
     db = await freshDb('upkeep_test')
     es = connectElastic(elasticUrl!)
-    await ensureIndex(es, INDEX)
+    // From PR 2 the comparison's independent copy is the current managed index.
+    await createManagedIndex(es, INDEX)
+    await db.query(`update search_control set es_in_use = true, es_current = true, elastic_index = $1`, [INDEX])
     projector = new Projector({ db, es, index: INDEX, plcUrl: 'http://127.0.0.1:1', log: () => {} })
     handler = new Handler(db, projector, () => {})
     for (let n = 1; n <= 3; n++) {
       await handler.handle(commit(EVENT, `3ke${n}`, eventValue({ name: `e${n}` })))
       await handler.handle(commit(SIDECAR, `3ks${n}`, sidecarValue(AUTHOR, `3ke${n}`, geo('37.78', '-122.43'))))
     }
-    // As before this change: today's index written, Postgres empty.
+    // The managed index written, Postgres emptied, as before a first fill.
     await db.query('truncate event_docs')
+    await db.query('truncate es_pending')
   })
   after(async () => {
     await es.indices.delete({ index: INDEX }).catch(() => {})
@@ -855,7 +866,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await upkeep.run()
     let row = await readControl(db)
     assert.equal(row.pgVerified, false)
-    assert.match(row.note!, /1 only in Elasticsearch \(at:\/\/.*3ks1\)/)
+    assert.match(row.note!, /1 only in the managed index [^ ]+ \(at:\/\/.*3ks1\)/)
     assert.match(row.note!, /1 with different content \(at:\/\/.*3ks2\)/)
 
     await projector.fillPostgres(`at://${AUTHOR}/${SIDECAR}/3ks1`)
@@ -894,12 +905,10 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await upkeep.run()
     row = await readControl(db)
     assert.equal(row.firstFillDone, true)
-    // The refill reads the stored records, which never had the edit, so it differs from today's index until that is projected too.
-    assert.equal(row.pgVerified, false)
-    await projector.projectSidecar(s1)
-    await db.query('update search_control set compared_at = null')
-    await upkeep.run()
-    assert.equal((await readControl(db)).pgVerified, true)
+    // The refill reads the stored records, which never had the edit, and
+    // writes them to Postgres and to the managed index alike (in use).
+    assert.equal(row.pgVerified, true, row.note ?? '')
+    assert.notEqual((await projector.elastic.get(s1))!.eventCid, 'bafyedited')
   })
 
   it('clears verification when old code changes records or accounts, even if it fails before index_state', async () => {
@@ -1148,25 +1157,55 @@ describe('projector writes', { skip: !databaseUrl && 'TEST_DATABASE_URL not set'
     es = memoryElastic()
     projector = new Projector({ db, es, index: 'events', plcUrl: 'http://127.0.0.1:1', log: () => {} })
     handler = new Handler(db, projector, () => {})
+    await db.query(`update search_control set es_in_use = true, es_current = true, elastic_index = 'events'`)
   })
   after(() => db.end())
 
-  it('writes Postgres first, then today\'s index; an Elasticsearch failure fails the event, and the replay writes both', async () => {
+  it('sends Elasticsearch nothing while it is not in use, and stops writing today\'s index', async () => {
+    await db.query(`update search_control set es_in_use = false, es_current = false, elastic_index = null`)
+    const calls = es.calls
+    await handler.handle(commit(EVENT, '3kew9', eventValue({ name: 'quiet' })))
+    await handler.handle(commit(SIDECAR, '3ksw9', sidecarValue(AUTHOR, '3kew9', geo('37.78', '-122.43'))))
+    assert.ok(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ksw9`))
+    assert.equal(es.calls, calls)
+    assert.equal((await db.query('select count(*)::int as n from es_pending')).rows[0].n, 0)
+    await db.query(`update search_control set es_in_use = true, es_current = true, elastic_index = 'events'`)
+  })
+
+  it('writes Postgres first, then the managed index with Postgres\'s version; a failure leaves the write pending and the event goes on', async () => {
     await handler.handle(commit(EVENT, '3kew1', eventValue({ name: 'first' })))
     es.down = true
-    const failed = commit(SIDECAR, '3ksw1', sidecarValue(AUTHOR, '3kew1', geo('37.78', '-122.43')))
-    await assert.rejects(handler.handle(failed))
-    assert.ok(await projector.postgres.get(sidecar), 'Postgres was written before Elasticsearch failed')
+    await handler.handle(commit(SIDECAR, '3ksw1', sidecarValue(AUTHOR, '3kew1', geo('37.78', '-122.43'))))
+    assert.ok(await projector.postgres.get(sidecar), 'Postgres was written')
     assert.equal(es.docs.has(sidecar), false)
+    const pending = await db.query<{ version: string }>('select version::text from es_pending where uri = $1', [sidecar])
+    assert.equal(pending.rowCount, 1)
     es.down = false
-    // The replay is the same event, revision and all.
-    await handler.handle(failed)
+    await projector.managed.replay(0)
     assert.ok(es.docs.has(sidecar))
+    const current = await db.query<{ version: string }>('select version::text from event_docs where uri = $1 and closed_version is null', [sidecar])
+    assert.equal(String(es.versions().get(sidecar)), current.rows[0].version)
     assert.equal(comparable((await projector.postgres.get(sidecar))!), comparable(es.docs.get(sidecar) as EventDoc))
+    assert.equal((await db.query('select 1 from es_pending')).rowCount, 0)
 
     await handler.handle(commit(EVENT, '3kew1'))
     assert.equal(await projector.postgres.get(sidecar), undefined)
     assert.equal(es.docs.has(sidecar), false)
+  })
+
+  it('never lets an older write replace a newer one in the managed index', async () => {
+    const uri = `at://${AUTHOR}/${SIDECAR}/3ksw7`
+    const d = (await projector.postgres.get(uri)) ?? { ...doc(7), uri }
+    const v1 = await projector.postgres.put({ ...d, view: { ...d.view, event: eventValue({ name: 'old' }) } })
+    const v2 = await projector.postgres.put({ ...d, view: { ...d.view, event: eventValue({ name: 'new' }) } })
+    await putManaged(es, 'events', { ...d, view: { ...d.view, event: eventValue({ name: 'new' }) } }, v2)
+    await putManaged(es, 'events', { ...d, view: { ...d.view, event: eventValue({ name: 'old' }) } }, v1)
+    assert.equal((es.docs.get(uri) as EventDoc).view.event.name, 'new')
+    const v3 = await projector.postgres.remove(uri)
+    await removeManaged(es, 'events', uri, v3)
+    await putManaged(es, 'events', { ...d, view: { ...d.view, event: eventValue({ name: 'old' }) } }, v2)
+    assert.equal(es.docs.has(uri), false, 'a delete is remembered, so an older put after it is refused')
+    await db.query('delete from es_pending')
   })
 
   it('takes every event of a suppressed account out of Postgres and marks it, even while Elasticsearch fails', async () => {
@@ -1179,7 +1218,7 @@ describe('projector writes', { skip: !databaseUrl && 'TEST_DATABASE_URL not set'
     await db.query('update accounts set active = false where did = $1', [AUTHOR])
     await db.query('insert into accounts (did, active) values ($1, false) on conflict (did) do update set active = false', [AUTHOR])
     es.down = true
-    await assert.rejects(projector.projectAccount(AUTHOR))
+    await projector.projectAccount(AUTHOR)
     es.down = false
     for (const uri of uris) assert.equal(await projector.postgres.get(uri), undefined, uri)
     const states = await db.query<{ complete: boolean }>('select complete from index_state where uri = any($1)', [uris])

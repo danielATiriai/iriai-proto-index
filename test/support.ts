@@ -22,30 +22,150 @@ export async function freshDb(name: string): Promise<Db> {
   return db
 }
 
-/** Just enough of the Elasticsearch client for the projector, kept in memory. Writes fail while `down` is set. */
-export function memoryElastic(): Elastic & { docs: Map<string, unknown>; down: boolean } {
-  const docs = new Map<string, unknown>()
-  const es = {
-    docs,
-    down: false,
-    index: async ({ id, document }: { id: string; document: unknown }) => {
-      if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
-      docs.set(id, document)
-    },
-    delete: async ({ id }: { id: string }) => {
-      if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
-      docs.delete(id)
-    },
-    get: async ({ id }: { id: string }) => (docs.has(id) ? { found: true, _source: docs.get(id) } : { found: false }),
-    indices: {
-      exists: async () => {
-        if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
-        return true
-      },
-      refresh: async () => {},
-    },
-    search: async () => ({ hits: { hits: [...docs].map(([id, doc]) => ({ _id: id, _source: doc })) } }),
+type Stored = { doc?: unknown; version: number }
+
+/**
+ * Just enough of the Elasticsearch client for the projector and the managed
+ * index, kept in memory: indexes, write aliases (require_alias), external
+ * versions with delete tombstones, bulk, refresh and cluster health. Every
+ * call fails while `down` is set. `docs` shows the documents of `index`
+ * (default "events").
+ */
+export function memoryElastic(index = 'events'): Elastic & {
+  docs: Map<string, unknown>
+  down: boolean
+  versions(name?: string): Map<string, number>
+  indexes: Map<string, Map<string, Stored>>
+  calls: number
+} {
+  const indexes = new Map<string, Map<string, Stored>>()
+  const aliases = new Map<string, string>()
+  const fail = () => {
+    es.calls++
+    if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
   }
+  const responseError = (statusCode: number, type: string) =>
+    new errors.ResponseError({ statusCode, body: { error: { type }, status: statusCode }, headers: {}, warnings: null, meta: {} as never } as never)
+  const target = (name: string, requireAlias = false) => {
+    if (aliases.has(name)) return indexes.get(aliases.get(name)!)!
+    if (requireAlias) throw responseError(404, 'index_not_found_exception')
+    let docs = indexes.get(name)
+    // Auto-creation, as Elasticsearch does for a write to a missing index.
+    if (!docs) indexes.set(name, (docs = new Map()))
+    return docs
+  }
+  /** Writes one operation; returns the status Elasticsearch would. */
+  const write = (name: string, id: string, doc: unknown | undefined, version: number | undefined, requireAlias: boolean): number => {
+    if (doc === undefined && !aliases.has(name) && !indexes.has(name)) return 404
+    const docs = target(name, requireAlias)
+    const prior = docs.get(id)
+    if (version !== undefined && prior && prior.version >= version) return 409
+    if (doc === undefined) {
+      if (!prior?.doc && version === undefined) return 404
+      docs.set(id, { version: version ?? (prior?.version ?? 0) + 1 })
+      return prior?.doc ? 200 : 404
+    }
+    docs.set(id, { doc, version: version ?? (prior?.version ?? 0) + 1 })
+    return 200
+  }
+  const live = (name: string) => [...(indexes.get(aliases.get(name) ?? name) ?? new Map<string, Stored>())].filter(([, s]) => s.doc !== undefined)
+  const es = {
+    down: false,
+    calls: 0,
+    indexes,
+    get docs() {
+      return new Map(live(index).map(([id, s]) => [id, s.doc]))
+    },
+    versions: (name = index) => new Map(live(name).map(([id, s]) => [id, s.version])),
+    index: async (
+      p: { index: string; id: string; document: unknown; version?: number; require_alias?: boolean },
+      opts: { ignore?: number[] } = {},
+    ) => {
+      fail()
+      const status = write(p.index, p.id, p.document, p.version, !!p.require_alias)
+      if (status >= 300 && !opts.ignore?.includes(status)) throw responseError(status, 'version_conflict_engine_exception')
+      return { result: status === 200 ? 'updated' : 'noop' }
+    },
+    delete: async (p: { index: string; id: string; version?: number }, opts: { ignore?: number[] } = {}) => {
+      fail()
+      if (!indexes.has(aliases.get(p.index) ?? p.index)) {
+        if (opts.ignore?.includes(404)) return { error: { type: 'index_not_found_exception' } }
+        throw responseError(404, 'index_not_found_exception')
+      }
+      const status = write(p.index, p.id, undefined, p.version, false)
+      if (status >= 300 && !opts.ignore?.includes(status)) throw responseError(status, 'version_conflict_engine_exception')
+      return { result: status === 200 ? 'deleted' : 'not_found' }
+    },
+    bulk: async ({ operations }: { operations: Record<string, unknown>[] }) => {
+      fail()
+      const items = []
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i]
+        if (op.index) {
+          const m = op.index as { _index: string; _id: string; version?: number; require_alias?: boolean }
+          let status: number
+          try {
+            status = write(m._index, m._id, operations[++i], m.version, !!m.require_alias)
+          } catch {
+            status = 404
+          }
+          items.push({ index: { status, ...(status === 404 ? { error: { type: 'index_not_found_exception' } } : {}) } })
+        } else {
+          const m = op.delete as { _index: string; _id: string; version?: number }
+          const exists = indexes.has(aliases.get(m._index) ?? m._index)
+          const status = exists ? write(m._index, m._id, undefined, m.version, false) : 404
+          items.push({ delete: { status, ...(exists ? {} : { error: { type: 'index_not_found_exception' } }) } })
+        }
+      }
+      return { items }
+    },
+    get: async ({ index: name, id }: { index: string; id: string }) => {
+      fail()
+      const s = indexes.get(aliases.get(name) ?? name)?.get(id)
+      return s?.doc ? { found: true, _source: s.doc } : { found: false }
+    },
+    cluster: {
+      health: async () => {
+        fail()
+        return { status: 'green' }
+      },
+    },
+    indices: {
+      exists: async ({ index: name }: { index: string }) => {
+        fail()
+        return index === name || indexes.has(name)
+      },
+      create: async ({ index: name, aliases: al }: { index: string; aliases?: Record<string, unknown> }) => {
+        fail()
+        if (indexes.has(name)) throw responseError(400, 'resource_already_exists_exception')
+        indexes.set(name, new Map())
+        for (const a of Object.keys(al ?? {})) aliases.set(a, name)
+      },
+      get: async ({ index: pattern }: { index: string }) => {
+        fail()
+        const prefix = pattern.replace(/\*$/, '')
+        return Object.fromEntries([...indexes.keys()].filter((n) => n.startsWith(prefix)).map((n) => [n, {}]))
+      },
+      delete: async ({ index: name }: { index: string }) => {
+        fail()
+        indexes.delete(name)
+        for (const [a, n] of aliases) if (n === name) aliases.delete(a)
+      },
+      refresh: async () => {
+        fail()
+      },
+    },
+    search: async (p: { index?: string; size?: number; search_after?: unknown[] }) => {
+      fail()
+      const all = live(p.index ?? index).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      const after = p.search_after?.[0] as string | undefined
+      const page = all.filter(([id]) => after === undefined || id > after).slice(0, p.size ?? 10)
+      return { hits: { hits: page.map(([id, s]) => ({ _id: id, _source: s.doc, _version: s.version, sort: [id] })) } }
+    },
+  }
+  // The default index exists and takes writes through its alias, as a managed index does.
+  indexes.set(index, new Map())
+  aliases.set(`${index}-write`, index)
   return es as never
 }
 

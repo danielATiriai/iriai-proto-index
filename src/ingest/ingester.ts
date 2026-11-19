@@ -1,9 +1,11 @@
 import type { Db } from '../db.js'
-import type { Settings } from '../settings.js'
+import { DEFAULT_THRESHOLDS, type Settings } from '../settings.js'
 import { COLLECTIONS, type Projector } from './projector.js'
 import { Handler, type JetstreamEvent } from './handler.js'
 import { isTransient } from './transient.js'
 import { SearchUpkeep } from '../search/verify.js'
+import { SearchController } from '../search/controller.js'
+import { GitHubIssues } from '../search/issues.js'
 import {
   accountsAwaitingRebuild,
   knownDids,
@@ -20,6 +22,10 @@ const FLUSH_MS = 1_000
 const RETRY_MS = 60_000
 /** Search upkeep: pruning, the first fill and the hourly comparison (spec 5.4). */
 const UPKEEP_MS = 10 * 60_000
+/** The scale controller (spec 6). */
+const CONTROLLER_MS = 10 * 60_000
+/** Keep-awake and replay while Elasticsearch is in use (spec 5.2). */
+const KEEP_MS = 2 * 60_000
 /** An event failing this many times with an error a retry cannot change is skipped and recorded. */
 const MAX_TRIES = 3
 const MAX_BACKOFF_MS = 30_000
@@ -67,6 +73,7 @@ export class Ingester {
   readonly status: IngesterStatus = { connected: false, disconnectedSince: Date.now(), handled: 0, errors: 0, skipped: 0 }
   private handler: Handler
   readonly upkeep: SearchUpkeep
+  readonly controller: SearchController
   private stopped = false
   private ws?: Socket
   private queue: Promise<void> = Promise.resolve()
@@ -88,6 +95,18 @@ export class Ingester {
   ) {
     this.handler = new Handler(db, projector, log)
     this.upkeep = new SearchUpkeep(db, projector, log)
+    this.controller = new SearchController({
+      db,
+      managed: projector.managed,
+      postgres: projector.postgres,
+      elastic: projector.elastic,
+      legacyIndex: settings.elasticIndex,
+      issues: new GitHubIssues(db, settings.githubAlertToken, settings.githubAlertRepo, log),
+      searchEs: settings.searchEs,
+      thresholds: settings.thresholds ?? DEFAULT_THRESHOLDS,
+      startedAt: new Date(),
+      log,
+    })
     this.openSocket = options.openSocket ?? ((url) => new WebSocket(url))
     this.backoffMs = options.backoffMs ?? 1_000
   }
@@ -110,8 +129,21 @@ export class Ingester {
     await this.backfill()
     this.timers.push(setInterval(() => this.enqueue(() => this.retry()), RETRY_MS))
     this.timers.push(setInterval(() => this.enqueue(() => this.upkeep.run()), UPKEEP_MS))
+    // The controller and the keep-awake run beside event handling, not in
+    // its queue: a build copies every event and must not hold up ingestion.
+    // Writes landing meanwhile are covered by external versions, es_pending
+    // and the reconcile (spec 5.1, 6.4).
+    const controller = this.controller
+    let ticking: Promise<void> = Promise.resolve()
+    const tick = () => (ticking = ticking.then(() => controller.tick()))
+    void controller.keep().then(tick)
+    this.timers.push(setInterval(() => void tick(), CONTROLLER_MS))
+    this.timers.push(setInterval(() => void controller.keep(), KEEP_MS))
+    this.ticking = () => ticking
     await this.connect()
   }
+
+  private ticking: () => Promise<void> = () => Promise.resolve()
 
   async stop(): Promise<void> {
     this.stopped = true
@@ -119,6 +151,7 @@ export class Ingester {
     clearTimeout(this.reconnectTimer)
     this.ws?.close()
     await this.queue
+    await this.ticking()
     await this.flush()
   }
 

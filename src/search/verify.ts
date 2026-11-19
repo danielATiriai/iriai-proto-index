@@ -92,7 +92,7 @@ export class SearchUpkeep {
     if (row.pgVerified) return
     if (row.comparedAt && this.now() - row.comparedAt.getTime() < COMPARE_EVERY_MS) return
     const result = await this.compare()
-    this.log(`search: comparison with today's index ${result.ok ? 'passed; Postgres is verified' : `did not pass: ${result.note}`}`)
+    this.log(`search: comparison ${result.ok ? 'passed; Postgres is verified' : `did not pass: ${result.note}`}`)
   }
 
   /**
@@ -118,9 +118,11 @@ export class SearchUpkeep {
   }
 
   /**
-   * Compares Postgres's current documents with today's index by document id
-   * and content (not versions, and not indexedAt, which records when each
-   * copy was written). The result is recorded only if the fill is done and
+   * Compares Postgres's current documents by document id and content (not
+   * versions, and not indexedAt, which records when each copy was written)
+   * with an independent copy. From PR 2 today's index is no longer written,
+   * so the copy is the managed index when one is current, else every sidecar
+   * assembled again from stored records. The result is recorded only if the fill is done and
    * the generation has not moved since the comparison began: a pass sets
    * pg_verified and a comparison that finds a difference clears it; one that
    * could not run changes nothing. Upkeep runs on one ingester at a time.
@@ -129,18 +131,22 @@ export class SearchUpkeep {
     let ok = false
     let ran = false
     let note: string
+    let against = 'its copy'
     const { generation } = await readControl(this.db)
     try {
-      const [pg, es] = [await this.projector.postgres.currentDocs(), await this.projector.elastic.allDocs()]
+      const control = await readControl(this.db)
+      const managed = control.esInUse && control.esCurrent && control.elasticIndex
+      against = managed ? `the managed index ${control.elasticIndex}` : 'stored records assembled again'
+      const [pg, es] = [await this.projector.postgres.currentDocs(), managed ? await this.projector.elastic.withIndex(control.elasticIndex!).allDocs() : await this.reassembled()]
       const missing = [...es.keys()].filter((uri) => !pg.has(uri))
       const extra = [...pg.keys()].filter((uri) => !es.has(uri))
       const differ = [...pg.keys()].filter((uri) => es.has(uri) && comparable(pg.get(uri)!) !== comparable(es.get(uri)!))
       ran = true
       ok = missing.length === 0 && extra.length === 0 && differ.length === 0
       note = ok
-        ? `matched today's index: ${pg.size} documents`
+        ? `matched ${against}: ${pg.size} documents`
         : [
-            missing.length && `${missing.length} only in Elasticsearch (${missing.slice(0, LISTED).join(', ')})`,
+            missing.length && `${missing.length} only in ${against} (${missing.slice(0, LISTED).join(', ')})`,
             extra.length && `${extra.length} only in Postgres (${extra.slice(0, LISTED).join(', ')})`,
             differ.length && `${differ.length} with different content (${differ.slice(0, LISTED).join(', ')})`,
           ]
@@ -149,7 +155,7 @@ export class SearchUpkeep {
     } catch (err) {
       // Health is public, so the note says what happened, not the error text.
       this.log(`search: comparison could not run: ${(err as Error).message}`)
-      note = 'comparison could not run: Elasticsearch or Postgres did not answer; retrying at the next upkeep'
+      note = `comparison with ${against} could not run; retrying at the next upkeep`
     }
     const res = await (this.publisher ?? this.db).query(
       `update search_control
@@ -160,6 +166,17 @@ export class SearchUpkeep {
     )
     if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }
     return { ok, note }
+  }
+
+  /** Every complete sidecar in index_state as stored records assemble it now. */
+  private async reassembled(): Promise<Map<string, EventDoc>> {
+    const out = new Map<string, EventDoc>()
+    const uris = (await this.db.query<{ uri: string }>('select uri from index_state order by uri')).rows.map((r) => r.uri)
+    for (const uri of uris) {
+      const doc = await this.projector.assembled(uri)
+      if (doc) out.set(uri, doc)
+    }
+    return out
   }
 
   /**

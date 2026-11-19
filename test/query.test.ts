@@ -62,6 +62,8 @@ describe(`query API on ${BACKEND}`, { skip: (!databaseUrl || !elasticUrl) && 'TE
     await ensureIndex(es, INDEX)
     // Postgres is verified, so either backend may serve; the force picks one.
     await db.query('update search_control set first_fill_done = true, pg_verified = true')
+    // INDEX plays the current managed index, so it may serve (spec 5.2).
+    await db.query(`update search_control set es_in_use = true, es_current = true, elastic_index = $1`, [INDEX])
     const search = { elastic: new ElasticBackend(es, INDEX), postgres: new PostgresBackend(db), control: new SearchControl(db), force: BACKEND }
     deps = { db, search, serviceId: 'test', cursorKey: randomBytes(32) }
     for (const s of SPECS) {

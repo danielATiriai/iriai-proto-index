@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { config, contractsRoot } from '../contracts/contracts.js'
 import type { Db } from '../db.js'
 import { route } from '../search/control.js'
+import { todayPgP95 } from '../search/stats.js'
 import { CHECKPOINT } from '../ingest/ingester.js'
 import { readCheckpoint } from '../ingest/store.js'
 import { CursorError } from './cursor.js'
@@ -114,10 +115,20 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   try {
     const row = await search.control.refresh()
     out.search = {
-      force: search.force,
+      state: row.state,
+      stateSince: row.since.toISOString(),
+      force: search.force ?? null,
       chosen: route(search.force, row) ?? null,
       lastServed: search.last ?? null,
-      esInUse: true,
+      esInUse: row.esInUse,
+      esCurrent: row.esCurrent,
+      elasticIndex: row.elasticIndex,
+      esPendingStale: row.pendingStale,
+      esSeenAt: row.esSeenAt?.toISOString() ?? null,
+      controllerDisabled: row.disabled,
+      controller: row.controllerNote,
+      p95Ms: await todayPgP95(deps.db).catch(() => null),
+      events: await countEvents(deps.db).catch(() => null),
       pgFirstFillDone: row.firstFillDone,
       pgVerified: row.pgVerified,
       comparedAt: row.comparedAt?.toISOString() ?? null,
@@ -129,6 +140,11 @@ async function health(deps: ServerDeps): Promise<Record<string, unknown>> {
   }
   out.index = await probeNewSession(search)
   return { ...out, ...(deps.health?.() ?? {}) }
+}
+
+/** Current events in Postgres (spec 5.3), without the write lock: health need not wait for a write. */
+async function countEvents(db: Db): Promise<number> {
+  return Number((await db.query<{ n: string }>('select count(*) as n from event_docs where closed_version is null')).rows[0].n)
 }
 
 /**

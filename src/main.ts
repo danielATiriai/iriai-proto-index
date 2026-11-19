@@ -6,6 +6,7 @@ import { Projector } from './ingest/projector.js'
 import { createQueryServer } from './query/server.js'
 import { SearchControl, controlPool } from './search/control.js'
 import { PostgresBackend, searchPool } from './search/postgres.js'
+import { SearchStats } from './search/stats.js'
 import { loadSettings } from './settings.js'
 
 // One image, two Railway services: ROLE=ingester reads Jetstream and keeps
@@ -16,8 +17,8 @@ const log = (msg: string) => console.log(`[${settings.role}] ${msg}`)
 const db = connect(settings.databaseUrl, log)
 const es = connectElastic(settings.elasticUrl)
 
-// Neither role waits for Elasticsearch (spec 5.2): the ingester creates
-// today's index on its first write, and the query service routes around it.
+// Neither role waits for Elasticsearch (spec 5.2): the ingester writes it only
+// while it is in use, and the query service routes around it.
 await waitFor('PostgreSQL', () => migrate(db))
 log(
   (await searchWriterSeen(db))
@@ -31,6 +32,10 @@ if (settings.role !== 'query') {
   ingester = new Ingester(settings, db, projector, log)
   await ingester.start()
 }
+
+// Daily search stats and shadow queries (spec 6.1), on the query role.
+const stats = settings.role === 'ingester' ? undefined : new SearchStats(db, log)
+stats?.start()
 
 const ingestionHealth = () => (ingester ? { ingester: { healthy: ingester.healthy, ...ingester.status } } : {})
 const server =
@@ -49,6 +54,8 @@ const server =
           postgres: new PostgresBackend(db, searchPool(settings.databaseUrl, log)),
           control: new SearchControl(controlPool(settings.databaseUrl, log)),
           force: settings.searchBackendForce,
+          stats,
+          recordFallback: async () => void (await db.query('insert into search_fallbacks default values')),
         },
         ...settings,
         health: ingestionHealth,
@@ -59,6 +66,7 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.on(signal, async () => {
     log(`${signal}: stopping`)
     server.close()
+    await stats?.flush().catch(() => {})
     await ingester?.stop()
     await db.end()
     process.exit(0)

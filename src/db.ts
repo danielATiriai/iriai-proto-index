@@ -192,6 +192,90 @@ begin
   end loop;
 end
 $do$;
+
+-- PR 2 (spec 5.1, 5.2, 6): the managed index and the scale controller.
+-- Columns are added only when missing: ALTER TABLE locks the table
+-- exclusively even when the column exists.
+--   state, since: the controller's state (6.4) and when it was entered.
+--   es_in_use: Elasticsearch is in use (5.2): written to, kept awake and
+--     replayed. Changed only under the write lock, so every write sees one
+--     answer for its whole transaction.
+--   es_current: the managed index elastic_index holds every current row.
+--   elastic_index, index_counter: the managed index and its build counter.
+--   es_seen_at, es_status: the last answered keep-awake and its cluster status.
+--   last_switch_on, failures (switch-on failure times), disabled: 6.4's limits.
+--   legacy_drop_after: today's index (ELASTICSEARCH_INDEX) is deleted after
+--     this, set on the first start of PR 2.
+--   reconciled_at: the last reconcile of the managed index (daily while in use).
+--   controller_note: the controller's last word, for health.
+do $do$
+declare c record;
+begin
+  for c in select * from (values
+    ('state', 'text not null default ''off'''),
+    ('since', 'timestamptz not null default now()'),
+    ('es_in_use', 'boolean not null default false'),
+    ('es_current', 'boolean not null default false'),
+    ('elastic_index', 'text'),
+    ('index_counter', 'integer not null default 0'),
+    ('es_seen_at', 'timestamptz'),
+    ('es_status', 'text'),
+    ('last_switch_on', 'timestamptz'),
+    ('failures', 'timestamptz[] not null default ''{}'''),
+    ('disabled', 'boolean not null default false'),
+    ('legacy_drop_after', 'timestamptz'),
+    ('reconciled_at', 'timestamptz'),
+    ('controller_note', 'text')
+  ) as v(name, def) loop
+    if not exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'search_control' and column_name = c.name) then
+      execute format('alter table search_control add column %I %s', c.name, c.def);
+    end if;
+  end loop;
+end
+$do$;
+
+-- One row per write Elasticsearch has not confirmed (spec 4.2): inserted in
+-- the write's own transaction while Elasticsearch is in use, deleted once
+-- Elasticsearch has it. A row older than 2 seconds keeps the managed index out
+-- of new sessions until replayed (spec 5.2).
+create table if not exists es_pending (
+  uri text collate "C" not null,
+  version bigint not null,
+  at timestamptz not null default clock_timestamp(),
+  primary key (uri, version)
+);
+create index if not exists es_pending_at on es_pending (at);
+
+-- One row per UTC day (spec 6.1): queryEvents calls, the search step's
+-- timings per backend as histograms (bucket i counts searches that took under
+-- SEARCH_BUCKETS_MS[i], the last bucket everything slower), Postgres timeouts,
+-- the current event count, and up to 200 query shapes. Kept 90 days; shapes
+-- cleared after 7.
+create table if not exists search_stats (
+  day date primary key,
+  calls bigint not null default 0,
+  pg_hist bigint[] not null default '{}',
+  es_hist bigint[] not null default '{}',
+  pg_timeouts bigint not null default 0,
+  events bigint,
+  shapes jsonb not null default '[]'
+);
+
+-- Adds two histograms element by element; a shorter one counts as zeros.
+create or replace function add_hist(a bigint[], b bigint[]) returns bigint[] language sql immutable parallel safe as $fn$
+  select coalesce(array_agg(coalesce(x, 0) + coalesce(y, 0) order by i), '{}') from unnest(a, b) with ordinality as t(x, y, i)
+$fn$;
+
+-- First pages that fell back from Elasticsearch to Postgres (spec 6.4, on).
+create table if not exists search_fallbacks (at timestamptz not null default now());
+create index if not exists search_fallbacks_at on search_fallbacks (at);
+
+-- When each kind of GitHub issue was last opened, so one cause opens at most
+-- one issue a day.
+create table if not exists search_alerts (
+  key text primary key,
+  opened_at timestamptz not null
+);
 `
 
 /**
@@ -238,6 +322,11 @@ export async function migrate(db: Db): Promise<void> {
       `insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes')
        on conflict (id) do update set elastic_cursors_until = greatest(search_control.elastic_cursors_until, excluded.elastic_cursors_until)`,
     )
+    // Today's index serves nothing from PR 2 on; it is kept for the hour of
+    // sessions that may still be open on it (spec 5.4), counted from the
+    // first start of PR 2, plus 14 minutes for PR 1 replicas still running
+    // while the deploy overlaps.
+    await client.query(`update search_control set legacy_drop_after = now() + interval '75 minutes' where id = 1 and legacy_drop_after is null`)
   } finally {
     const unlocked = await client.query<{ ok: boolean }>('select pg_advisory_unlock(7140014) as ok').then((r) => r.rows[0].ok, () => false)
     client.release(unlocked ? undefined : new Error('migration lock not confirmed released'))

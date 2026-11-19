@@ -107,31 +107,35 @@ describe('ingester', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () =
     assert.equal(ingester.status.connected, true)
   })
 
-  it('retries an event through an Elasticsearch outage for as long as it lasts, never skipping it', async () => {
+  it('keeps ingesting through an Elasticsearch outage, and the replay catches the managed index up', async () => {
+    await base.query(`update search_control set es_in_use = true, es_current = true, elastic_index = 'events'`)
     await ingester.start()
     const sidecar = commit('3ksidecar0030', SIDECAR, sidecarValue(AUTHOR, '3kevent000030', geo('37.78', '-122.43')))
     const event = commit('3kevent000030', EVENT, eventValue({ name: 'Survives an outage' }))
     net.records.set(`at://${AUTHOR}/${EVENT}/3kevent000030`, { cid: 'bafyreibjytuinufvu3gimfxyqjbptuws7g3sdekx2igq5dts4ar7jgxjbq', value: event.commit.record })
 
     es.down = true
-    for (let n = 1; n <= 5; n++) {
-      const s = await next(n)
-      s.send(event)
-      s.send(sidecar)
-      await until(() => s.closed, `failure ${n}`)
-    }
-    assert.equal(ingester.status.skipped, 0)
-
-    es.down = false
-    const s = await next(6)
+    const s = await next(1)
     s.send(event)
     s.send(sidecar)
-    await until(() => ingester.status.lastEventUs === sidecar.time_us, 'the sidecar to be handled')
-    assert.ok(es.docs.has(`at://${AUTHOR}/${SIDECAR}/3ksidecar0030`))
+    await until(() => ingester.status.lastEventUs === sidecar.time_us, 'the sidecar to be handled while Elasticsearch is down')
+    assert.equal(s.closed, false)
+    assert.equal(ingester.status.errors, 0)
+    const uri = `at://${AUTHOR}/${SIDECAR}/3ksidecar0030`
+    assert.ok((await base.query('select 1 from event_docs where uri = $1 and closed_version is null', [uri])).rowCount)
+    assert.equal(es.docs.has(uri), false)
+    assert.ok((await base.query('select 1 from es_pending where uri = $1', [uri])).rowCount)
+
+    es.down = false
+    await new Promise((r) => setTimeout(r, 2_100))
+    await ingester.controller.keep()
+    assert.ok(es.docs.has(uri))
+    assert.equal((await base.query('select 1 from es_pending where uri = $1', [uri])).rowCount, 0)
     const skipped = await base.query('select count(*)::int as n from skipped_events')
     assert.equal(skipped.rows[0].n, 0)
     // The checkpoint moves only once both are handled.
     await until(async () => (await readCheckpoint(base, CHECKPOINT))?.cursor === sidecar.time_us, 'the checkpoint', 3_000)
+    await base.query(`update search_control set es_in_use = false, es_current = false, elastic_index = null`)
   })
 
   it('skips and records an event that fails the same way every time, then carries on', async () => {

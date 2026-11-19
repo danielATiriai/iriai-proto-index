@@ -44,6 +44,8 @@ describe('ingestion', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () 
     net = await fakeNetwork()
     projector = new Projector({ db, es, index: 'events', plcUrl: net.url, log: () => {} })
     handler = new Handler(db, projector, () => {})
+    // Elasticsearch in use with a current managed index named events (spec 5.2).
+    await db.query(`update search_control set es_in_use = true, es_current = true, elastic_index = 'events'`)
   })
   after(async () => {
     await db.end()
@@ -87,22 +89,24 @@ describe('ingestion', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }, () 
     assert.equal((es.docs.get(sidecarUri) as { view: { event: { name: string } } }).view.event.name, 'Walk, after return')
   })
 
-  it('redoes a failed projection when the change is replayed', async () => {
+  it('goes on when Elasticsearch fails, and the replay brings the managed index up to date', async () => {
     const e = `at://${AUTHOR}/${EVENT}/3kevent000010`
     const s = `at://${AUTHOR}/${SIDECAR}/3ksidecar0010`
     await handler.handle(commit(AUTHOR, EVENT, '3kevent000010', eventValue({ name: 'Replayed' })))
     await handler.handle(commit(AUTHOR, SIDECAR, '3ksidecar0010', sidecarValue(AUTHOR, '3kevent000010', geo('37.78', '-122.43'))))
     assert.ok(es.docs.has(s))
-    // The deletion is stored, then Elasticsearch fails before the doc is removed.
+    // The deletion is stored and reaches Postgres; Elasticsearch fails, which no longer fails the event.
     const deletion = commit(AUTHOR, EVENT, '3kevent000010')
     es.down = true
-    await assert.rejects(handler.handle(deletion))
+    await handler.handle(deletion)
     es.down = false
     assert.equal((await getRecord(db, e))?.deleted, true)
+    assert.equal(await projector.postgres.get(s), undefined)
     assert.ok(es.docs.has(s))
-    // The ingester replays the same event, at the same revision.
-    await handler.handle(deletion)
+    assert.ok((await db.query('select 1 from es_pending where uri = $1', [s])).rowCount)
+    await projector.managed.replay(0)
     assert.equal(es.docs.has(s), false)
+    assert.equal((await db.query('select 1 from es_pending where uri = $1', [s])).rowCount, 0)
     const state = await db.query('select complete, reason from index_state where uri = $1', [s])
     assert.deepEqual(state.rows[0], { complete: false, reason: 'base-deleted' })
   })
