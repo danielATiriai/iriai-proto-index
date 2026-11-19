@@ -2,6 +2,7 @@ import { checkout, type Db } from '../db.js'
 import type { EventDoc } from '../index/assemble.js'
 import type { Projector } from '../ingest/projector.js'
 import { readControl } from './control.js'
+import type { Issues } from './issues.js'
 
 const COMPARE_EVERY_MS = 60 * 60_000
 const LISTED = 5
@@ -35,6 +36,8 @@ export class SearchUpkeep {
     private projector: Projector,
     private log: (msg: string) => void = console.log,
     private now: () => number = Date.now,
+    /** From PR 2 each failed comparison opens an issue (spec 5.2). */
+    private issues?: Issues,
   ) {}
 
   /**
@@ -120,9 +123,10 @@ export class SearchUpkeep {
   /**
    * Compares Postgres's current documents by document id and content (not
    * versions, and not indexedAt, which records when each copy was written)
-   * with an independent copy. From PR 2 today's index is no longer written,
-   * so the copy is the managed index when one is current, else every sidecar
-   * assembled again from stored records. The result is recorded only if the fill is done and
+   * with another copy. From PR 2 today's index is no longer written, so the
+   * copy is the managed index when one is current (itself filled from
+   * Postgres, so this catches a lost write, not a wrong projection), else
+   * every sidecar assembled again from stored records with the same code. The result is recorded only if the fill is done and
    * the generation has not moved since the comparison began: a pass sets
    * pg_verified and a comparison that finds a difference clears it; one that
    * could not run changes nothing. Upkeep runs on one ingester at a time.
@@ -165,6 +169,15 @@ export class SearchUpkeep {
       [ok, note, generation, ran],
     )
     if (res.rowCount === 0) return { ok: false, note: 'an ingestion table changed during the comparison; filling again' }
+    if (ran && !ok) {
+      await this.issues
+        ?.open(
+          'comparison',
+          'Search: the Postgres comparison did not pass',
+          `Postgres is not verified, so it may not serve new sessions; upkeep compares again hourly. ${note}`,
+        )
+        .catch((err) => this.log(`search: could not open the comparison issue: ${(err as Error).message}`))
+    }
     return { ok, note }
   }
 

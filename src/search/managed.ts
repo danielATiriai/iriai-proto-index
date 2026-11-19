@@ -161,8 +161,12 @@ export class ManagedIndex {
       await this.underWriteLock((c) => c.query('update search_control set elastic_index = $1, es_current = false, updated_at = now() where id = 1', [index]))
       const copied = await this.copyAll(index)
       const differences = await this.reconcile(index)
-      const left = await this.replay(0)
-      if (left > 0) throw new Error(`${left} writes still pending after the build's replay`)
+      await this.replay(0)
+      // A write that commits during the build leaves a fresh pending row,
+      // which its own after-commit write confirms; only one older than 2 s
+      // means the copy is incomplete.
+      const stale = await this.stalePending()
+      if (stale > 0) throw new Error(`${stale} writes still pending after the build's replay`)
       this.log(`elasticsearch: built ${index}: ${copied} documents copied, ${differences} differences reconciled`)
       return index
     } catch (err) {
@@ -188,16 +192,32 @@ export class ManagedIndex {
    * Compares every document id and version in the managed index with the
    * current rows (spec 6.4). Each document missing or older, and each with no
    * current row, gets an es_pending row, so a difference takes the index out
-   * of new sessions until replayed. Returns the number of differences.
+   * of new sessions until replayed. Returns the number of differences, not
+   * counting rows written after the scan began: their own writes carry them
+   * (spec 6.4, an event that changed during the check).
    */
   async reconcile(index: string): Promise<number> {
+    const mark = BigInt(
+      (await this.db.query<{ w: string }>(`select (case when is_called then last_value else 0 end)::text as w from event_doc_version`)).rows[0].w,
+    )
     const inEs = await managedVersions(this.es, index)
-    const current = (await this.db.query<{ uri: string; version: string }>('select uri, version::text from event_docs where closed_version is null')).rows
+    // Closed rows too: a document whose row closed after the scan began is
+    // carried by that write, not missing a delete.
+    const rows = (
+      await this.db.query<{ uri: string; version: string; open: boolean }>(
+        `select uri, version::text, closed_version is null as open from event_docs where closed_version is null or closed_version > $1::bigint`,
+        [String(mark)],
+      )
+    ).rows
     let differences = 0
     const behind: { uri: string; version: string }[] = []
-    for (const r of current) {
+    for (const r of rows) {
+      if (!r.open) {
+        inEs.delete(r.uri)
+        continue
+      }
       const v = inEs.get(r.uri)
-      if (v === undefined || v < BigInt(r.version)) behind.push(r)
+      if ((v === undefined || v < BigInt(r.version)) && BigInt(r.version) <= mark) behind.push(r)
       inEs.delete(r.uri)
     }
     for (let i = 0; i < behind.length; i += BATCH) {
@@ -224,16 +244,18 @@ export class ManagedIndex {
   }
 
   /**
-   * Ends use (spec 5.2), only once elastic_cursors_until has passed: clears
-   * es_in_use, es_current and es_pending under the write lock, then deletes
-   * the managed index and, once its hour is over, today's index. Returns false
-   * when the cursors' hour has not passed yet.
+   * Ends use (spec 5.2), only once elastic_cursors_until has passed and
+   * today's index is due for deletion (so it is deleted here, not left on the
+   * volume): clears es_in_use, es_current and es_pending under the write
+   * lock, then deletes the managed index and today's index. Returns false
+   * while either is still to come.
    */
   async endUse(legacyIndex: string): Promise<boolean> {
     const st = await this.state()
     if (st.elasticCursorsUntil.getTime() > Date.now()) return false
+    if (st.legacyDropAfter && !legacyGone(st)) return false
     await this.setInUse(false)
-    for (const index of [st.elasticIndex, legacyGone(st) ? legacyIndex : undefined]) {
+    for (const index of [st.elasticIndex, legacyIndex]) {
       if (!index) continue
       await deleteIndex(this.es, index).catch((err) => this.log(`elasticsearch: could not delete ${index}; it stays until use next begins: ${(err as Error).message}`))
     }
@@ -301,6 +323,15 @@ export class ManagedIndex {
       [uris],
     )
     return new Map(res.rows.map((r) => [r.uri, { version: BigInt(r.version), doc: r.doc }]))
+  }
+
+  /** Pending rows older than 2 s: while any exists the managed index may not serve (spec 5.2). */
+  async stalePending(olderThanMs = PENDING_MS): Promise<number> {
+    const r = await this.db.query<{ n: string }>(
+      `select count(*) as n from es_pending where at < clock_timestamp() - make_interval(secs => $1::float8 / 1000)`,
+      [olderThanMs],
+    )
+    return Number(r.rows[0].n)
   }
 
   async pendingCount(): Promise<number> {

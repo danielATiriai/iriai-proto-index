@@ -862,10 +862,12 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await projector.postgres.remove(`at://${AUTHOR}/${SIDECAR}/3ks1`)
     await projector.postgres.put({ ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks2`))!, eventCid: 'bafychanged' })
     let now = Date.now()
-    const upkeep = new SearchUpkeep(db, projector, () => {}, () => now)
+    const opened: string[] = []
+    const upkeep = new SearchUpkeep(db, projector, () => {}, () => now, { open: async (key) => void opened.push(key) })
     await upkeep.run()
     let row = await readControl(db)
     assert.equal(row.pgVerified, false)
+    assert.deepEqual(opened, ['comparison'], 'from PR 2 a failed comparison opens an issue')
     assert.match(row.note!, /1 only in the managed index [^ ]+ \(at:\/\/.*3ks1\)/)
     assert.match(row.note!, /1 with different content \(at:\/\/.*3ks2\)/)
 

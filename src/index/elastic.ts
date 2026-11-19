@@ -63,7 +63,17 @@ export const WRITE_MS = 2_000
 const WRITE_OPTS = { requestTimeout: WRITE_MS, maxRetries: 0 }
 
 /** Creates a managed index: today's mapping, deletes remembered 2 hours (spec 5.4), and its write alias. */
+/**
+ * Keeps Elasticsearch from creating a managed index or its write alias by
+ * itself: a delete with an external version re-creates a missing index, so
+ * after use ends or a candidate is dropped, a late delete would leave a stray
+ * index on the volume. Today's index (placeproto-events-v1) and every other
+ * name are left as they were, so PR 1's code still works after a revert.
+ */
+export const AUTO_CREATE = `+${MANAGED_PREFIX}v*,-${MANAGED_PREFIX}*,+*`
+
 export async function createManagedIndex(es: Elastic, index: string): Promise<void> {
+  await es.cluster.putSettings({ persistent: { 'action.auto_create_index': AUTO_CREATE } }, { requestTimeout: 10_000 })
   await es.indices.create({
     index,
     mappings: EVENT_MAPPING,

@@ -20,6 +20,8 @@ const FAILURES_TO_DISABLE = 2
 const ON_DAYS = 3
 const OFF_DAYS = 14
 const MIN_ON_DAYS = 30
+/** A pending write this old is stuck: an issue, and an Elasticsearch that is on drains. */
+const STUCK_MS = 30 * 60_000
 
 export interface ControllerDeps {
   db: Db
@@ -126,7 +128,6 @@ export class SearchController {
         const why = await this.onReason(events)
         if (!why) return this.setState('off', 'the switch-on condition no longer holds')
         await this.deps.issues.open('switch-on', 'Search: turning Elasticsearch on', `The scale trigger was met: ${why}. The controller is turning Elasticsearch on, filling and checking it, then moving new searches to it.`)
-        await this.deps.db.query('update search_control set last_switch_on = now() where id = 1')
         await managed.setInUse(true)
         return this.setState('starting', why)
       }
@@ -159,6 +160,9 @@ export class SearchController {
           const note = await this.verify()
           if (note) return this.fail(row, note)
           await managed.markCurrent(row.elasticIndex!)
+          // A switch-on is one that reached on (spec 6.4): a failed attempt
+          // counts as a failure instead, so two failures can disable.
+          await this.deps.db.query('update search_control set last_switch_on = now() where id = 1')
           return this.setState('on', 'verified: the managed index matches Postgres')
         } catch (err) {
           this.log(`search controller: verifying could not run: ${(err as Error).message}`)
@@ -197,6 +201,13 @@ export class SearchController {
           await managed.markCurrent(index)
         }
         await managed.dropLegacyWhenDue(legacyIndex)
+        if ((await managed.stalePending(STUCK_MS)) > 0) {
+          await this.deps.issues.open(
+            'pending',
+            'Search: Elasticsearch writes have been pending for over 30 minutes',
+            'The managed index may not serve while they wait, so new sessions use Postgres. Details are in the ingester log.',
+          )
+        }
         const fresh = await readControl(this.deps.db)
         if (fresh.esCurrent && fresh.elasticIndex && (await this.reconcileDue())) {
           const n = await managed.reconcile(fresh.elasticIndex)
@@ -215,6 +226,13 @@ export class SearchController {
     }
     if (!row.esInUse) {
       if (row.state === 'draining') await this.setState('off', 'Elasticsearch use has ended')
+      if (!row.pgVerified) {
+        await this.deps.issues.open(
+          'unverified-outage',
+          'Search: Postgres is not verified and Elasticsearch is not in use, so search answers 503',
+          'Upkeep fills and compares Postgres again every 10 minutes. Setting SEARCH_ES=on on the ingester builds a managed index, which SEARCH_BACKEND_FORCE=elastic on the query service can then serve.',
+        )
+      }
       return
     }
     if (!row.pgVerified) {
@@ -254,6 +272,9 @@ export class SearchController {
         [startedAt],
       )
     ).rows[0]
+    if (await this.deps.managed.stalePending(STUCK_MS)) {
+      return { why: 'a write has been pending for over 30 minutes, so the managed index may not serve', issue: true }
+    }
     if (Number(health.fallbacks) > FALLBACKS_TO_DRAIN && health.seen_recent) {
       return { why: `${health.fallbacks} first pages fell back to Postgres within 10 minutes while Elasticsearch answered its keep-awake`, issue: true }
     }
@@ -281,11 +302,14 @@ export class SearchController {
     for (let attempt = 0; ; attempt++) {
       await managed.replay(0)
       const differences = await managed.reconcile(row.elasticIndex)
-      if (differences === 0 && (await managed.pendingCount()) === 0) break
+      if (differences === 0 && (await managed.stalePending()) === 0) break
       if (attempt >= 3) return `the managed index still differs from Postgres in ${differences} documents after 3 replays`
     }
     const agreed = await backendsAgree(db, this.deps.postgres, this.deps.elastic.withIndex(row.elasticIndex))
-    if (!agreed.ok) return agreed.note
+    if (!agreed.ok) {
+      this.log(`search controller: ${agreed.detail}`)
+      return agreed.note
+    }
     this.log(`elasticsearch: verified on ${agreed.shapes} query shapes`)
     return undefined
   }
@@ -330,7 +354,12 @@ export class SearchController {
   }
 
   private async reconcileDue(): Promise<boolean> {
-    const r = await this.deps.db.query<{ due: boolean }>(`select coalesce(reconciled_at < now() - interval '1 day', true) as due from search_control where id = 1`)
+    // Daily, and once after today's index is due: PR 1 replicas still running
+    // in the deploy's overlap write event_docs without es_pending rows.
+    const r = await this.deps.db.query<{ due: boolean }>(
+      `select coalesce(reconciled_at < now() - interval '1 day' or (legacy_drop_after <= now() and reconciled_at < legacy_drop_after), true) as due
+       from search_control where id = 1`,
+    )
     return r.rows[0].due
   }
 }

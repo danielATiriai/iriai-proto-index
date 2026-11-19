@@ -94,14 +94,15 @@ export class Ingester {
     options: IngesterOptions = {},
   ) {
     this.handler = new Handler(db, projector, log)
-    this.upkeep = new SearchUpkeep(db, projector, log)
+    const issues = new GitHubIssues(db, settings.githubAlertToken, settings.githubAlertRepo, log)
+    this.upkeep = new SearchUpkeep(db, projector, log, Date.now, issues)
     this.controller = new SearchController({
       db,
       managed: projector.managed,
       postgres: projector.postgres,
       elastic: projector.elastic,
       legacyIndex: settings.elasticIndex,
-      issues: new GitHubIssues(db, settings.githubAlertToken, settings.githubAlertRepo, log),
+      issues,
       searchEs: settings.searchEs,
       thresholds: settings.thresholds ?? DEFAULT_THRESHOLDS,
       startedAt: new Date(),

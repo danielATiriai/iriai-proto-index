@@ -6,8 +6,10 @@ import { queryOfShape, storedShapes } from './stats.js'
 
 /** First results compared per shape (spec 6.4, verifying). */
 export const COMPARED = 50
-/** Fetched per backend, so a tie group that crosses position 50 can be compared whole. */
+/** Fetched per page; pages follow while a tie group crossing position 50 has not ended. */
 const FETCHED = 200
+/** A tie group longer than this cannot be compared whole and fails the check. */
+const MAX_FETCHED = 10_000
 /** Distances closer than this count as tied; events this close to a radius or box edge are ignored. */
 const TIE_M = 1
 const RETRIES = 3
@@ -51,12 +53,13 @@ function nearEdge(q: EventQuery, doc: EventDoc): boolean {
  * or box edge are ignored. Returns the uris involved in any difference.
  */
 export async function differences(a: SearchBackend, b: SearchBackend, q: EventQuery): Promise<string[]> {
-  const [left, right] = [await firstResults(a, q), await firstResults(b, q)]
+  const key0 = (d: EventDoc): number | null =>
+    q.sort === 'distance' && d.point ? arc(q.latitude!, q.longitude!, d.point.lat, d.point.lon) : null
+  const [left, right] = [await firstResults(a, q, key0), await firstResults(b, q, key0)]
   const keep = (docs: EventDoc[]) => docs.filter((d) => !nearEdge(q, d))
   const l = keep(left)
   const r = keep(right)
-  const key = (d: EventDoc): number | null =>
-    q.sort === 'distance' && d.point ? arc(q.latitude!, q.longitude!, d.point.lat, d.point.lon) : null
+  const key = key0
   const differ = new Set<string>()
   let i = 0
   while (i < Math.min(COMPARED, Math.max(l.length, r.length))) {
@@ -67,7 +70,7 @@ export async function differences(a: SearchBackend, b: SearchBackend, q: EventQu
       if (k(i) === null) j = l.length
       else while (j < l.length && k(j) !== null && Math.abs(k(j)! - k(j - 1)!) < TIE_M) j++
     }
-    const capped = j >= FETCHED && Math.max(left.length, right.length) >= FETCHED
+    const capped = j >= l.length && Math.max(left.length, right.length) >= MAX_FETCHED
     const ls = new Set(l.slice(i, j).map((d) => d.uri))
     const rs = new Set(r.slice(i, j).map((d) => d.uri))
     for (const u of ls) if (!rs.has(u)) differ.add(u)
@@ -79,10 +82,31 @@ export async function differences(a: SearchBackend, b: SearchBackend, q: EventQu
   return [...differ]
 }
 
-async function firstResults(backend: SearchBackend, q: EventQuery): Promise<EventDoc[]> {
-  const snap = await backend.openSnapshot()
+/**
+ * The first results of one backend: a page of 200, then further pages while
+ * the tie group that holds position 50 has not ended (spec 6.4: fetched
+ * whole), up to 10,000.
+ */
+async function firstResults(backend: SearchBackend, q: EventQuery, key: (d: EventDoc) => number | null): Promise<EventDoc[]> {
+  let snap = await backend.openSnapshot()
+  const out: EventDoc[] = []
+  const groupOpen = () => {
+    if (q.sort !== 'distance') return false
+    for (let n = Math.max(1, COMPARED); n < out.length; n++) {
+      const [a, b] = [key(out[n - 1]), key(out[n])]
+      if (a === null || b === null || Math.abs(b - a) >= TIE_M) return false
+    }
+    return true
+  }
   try {
-    return (await backend.page(snap, { ...q, limit: FETCHED }, undefined, FETCHED)).hits.map((h) => h.doc)
+    let after: unknown[] | undefined
+    for (;;) {
+      const res = await backend.page(snap, { ...q, limit: FETCHED }, after, FETCHED)
+      snap = res.snapshot
+      out.push(...res.hits.map((h) => h.doc))
+      if (res.hits.length < FETCHED || out.length >= MAX_FETCHED || !groupOpen()) return out
+      after = res.hits[res.hits.length - 1].sort
+    }
   } finally {
     void backend.closeSnapshot(snap).catch(() => {})
   }
@@ -98,7 +122,7 @@ export async function backendsAgree(
   db: Db,
   postgres: SearchBackend,
   elastic: SearchBackend,
-): Promise<{ ok: true; shapes: number } | { ok: false; note: string }> {
+): Promise<{ ok: true; shapes: number } | { ok: false; note: string; detail: string }> {
   const stored = await storedShapes(db, 200)
   const shapes = stored.length >= BUILT_IN ? stored.map((s) => queryOfShape(s, COMPARED)) : [...stored.map((s) => queryOfShape(s, COMPARED)), ...(await builtInShapes(db))]
   for (const q of shapes) {
@@ -108,7 +132,12 @@ export async function backendsAgree(
       if (differ.length === 0) break
       const changed = await changedSince(db, differ, w)
       if (changed && attempt < RETRIES) continue
-      return { ok: false, note: `the backends disagree on ${JSON.stringify(q)}: ${differ.slice(0, 5).join(', ')}` }
+      // The shape stays in the log: notes reach public health and issues.
+      return {
+        ok: false,
+        note: 'the backends disagree on a query shape (details in the ingester log)',
+        detail: `the backends disagree on ${JSON.stringify(q)}: ${differ.slice(0, 5).join(', ')}`,
+      }
     }
   }
   return { ok: true, shapes: shapes.length }

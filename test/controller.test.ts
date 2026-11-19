@@ -2,7 +2,7 @@ import { after, before, beforeEach, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Db } from '../src/db.js'
 import type { EventDoc } from '../src/index/assemble.js'
-import { createManagedIndex, putManaged, type ElasticBackend } from '../src/index/elastic.js'
+import { bulkManaged, createManagedIndex, putManaged, type ElasticBackend } from '../src/index/elastic.js'
 import { DEFAULT_THRESHOLDS } from '../src/settings.js'
 import { differences } from '../src/search/agreement.js'
 import type { SearchBackend } from '../src/search/backend.js'
@@ -117,7 +117,10 @@ describe('comparing the first 50 results (spec 6.4, verifying)', () => {
       name: 'postgres',
       openSnapshot: async () => '1',
       closeSnapshot: async () => {},
-      page: async () => ({ hits: docs.map((d) => ({ doc: d, sort: [] })), snapshot: '1' }),
+      page: async (_s: string, _q: unknown, after: number[] | undefined, size: number) => {
+        const from = after ? after[0] + 1 : 0
+        return { hits: docs.slice(from, from + size).map((d, i) => ({ doc: d, sort: [from + i] })), snapshot: '1' }
+      },
     }) as unknown as SearchBackend
   const q = { latitude: 37.78, longitude: -122.43, sort: 'distance' as const, limit: 50 }
 
@@ -136,6 +139,18 @@ describe('comparing the first 50 results (spec 6.4, verifying)', () => {
     const radius = { ...q, radiusMeters: 1000 }
     assert.deepEqual(await differences(backend([inside, edge]), backend([inside]), radius), [])
     assert.deepEqual(await differences(backend([inside, edge]), backend([edge]), radius), [inside.uri])
+  })
+
+  it('fetches a tie group that crosses position 50 whole, beyond the first page', async () => {
+    // 250 events at one point (an H3 cell's centre), listed in the same order
+    // by both; then one backend misses an event at position 230.
+    const same = Array.from({ length: 250 }, (_, n) => doc(n + 1, `e${n}`, 37.79, -122.43))
+    const at = { ...q, latitude: 37.79 }
+    assert.deepEqual(await differences(backend(same), backend([...same]), at), [])
+    const shuffled = [...same].reverse()
+    assert.deepEqual(await differences(backend(same), backend(shuffled), at), [], 'a tie group compares as a set')
+    const missing = same.filter((_, n) => n !== 230)
+    assert.deepEqual(await differences(backend(same), backend(missing), at), [same[230].uri])
   })
 
   it('compares start-time order exactly', async () => {
@@ -280,10 +295,14 @@ describe('the managed index and the controller', { skip: !databaseUrl && 'TEST_D
     assert.equal(await managed.endUse(LEGACY), false)
     assert.equal((await readControl(db)).esInUse, true)
     await db.query(`update search_control set elastic_cursors_until = now() - interval '1 second'`)
+    es.indexes.set(LEGACY, new Map())
+    assert.equal(await managed.endUse(LEGACY), false, 'not before today\'s index is due, so it is not left behind')
+    await db.query(`update search_control set legacy_drop_after = now() - interval '1 second'`)
     assert.equal(await managed.endUse(LEGACY), true)
     const r = await readControl(db)
     assert.deepEqual([r.esInUse, r.esCurrent, r.elasticIndex], [false, false, null])
     assert.equal(es.indexes.has(index), false)
+    assert.equal(es.indexes.has(LEGACY), false, 'today\'s index went with it')
     const calls = es.calls
     const v = await pg.put(doc(4, 'after'))
     assert.ok(v > 0n)
@@ -297,7 +316,11 @@ describe('the managed index and the controller', { skip: !databaseUrl && 'TEST_D
     await controller({ searchEs: true }).tick()
     let r = await readControl(db)
     assert.deepEqual([r.esInUse, r.esCurrent, r.elasticIndex, r.state], [true, true, 'placeproto-events-1', 'off'])
+    es.indexes.set(LEGACY, new Map())
     await db.query(`update search_control set elastic_cursors_until = now() - interval '1 second'`)
+    await controller({ searchEs: false }).tick()
+    assert.equal((await readControl(db)).esInUse, true, 'SEARCH_ES=off within the 75 minutes: in use until today\'s index is due')
+    await db.query(`update search_control set legacy_drop_after = now() - interval '1 second'`)
     await controller({ searchEs: false }).tick()
     r = await readControl(db)
     assert.deepEqual([r.esInUse, r.esCurrent], [false, false])
@@ -329,6 +352,7 @@ describe('the managed index and the controller', { skip: !databaseUrl && 'TEST_D
     r = await readControl(db)
     assert.equal(r.state, 'on', r.controllerNote ?? '')
     assert.equal(r.esCurrent, true)
+    assert.ok((await db.query(`select 1 from search_control where last_switch_on > now() - interval '1 minute'`)).rowCount, 'a switch-on is recorded when on is reached')
     assert.equal(route(undefined, r)?.backend, 'elastic')
 
     await db.query(`update search_control set es_seen_at = now()`)
@@ -338,7 +362,7 @@ describe('the managed index and the controller', { skip: !databaseUrl && 'TEST_D
     assert.equal(r.state, 'draining')
     assert.equal(route(undefined, r)?.backend, 'postgres')
     assert.equal(r.esInUse, true, 'in use until the cursors\' hour has passed')
-    await db.query(`update search_control set elastic_cursors_until = now() - interval '1 second'`)
+    await db.query(`update search_control set elastic_cursors_until = now() - interval '1 second', legacy_drop_after = now() - interval '1 second'`)
     await c.tick()
     r = await readControl(db)
     assert.deepEqual([r.state, r.esInUse], ['off', false])
@@ -367,15 +391,59 @@ describe('the managed index and the controller', { skip: !databaseUrl && 'TEST_D
     assert.equal(r.disabled, false)
     assert.ok(opened.includes('failure'))
     assert.deepEqual(managedIndexes(), [], 'the candidate no session used is gone')
+    assert.equal((await db.query('select last_switch_on from search_control')).rows[0].last_switch_on, null, 'a failed attempt is not a switch-on')
 
-    await db.query(`update search_control set last_switch_on = now() - interval '31 days', elastic_cursors_until = now() - interval '1 second'`)
+    // The next tick tries again; a second failure within 30 days disables.
     for (let i = 0; i < 4; i++) await c.tick()
     r = await readControl(db)
     assert.equal(r.state, 'off')
     assert.equal(r.disabled, true)
-    await db.query(`update search_control set last_switch_on = now() - interval '31 days'`)
     await c.tick()
     assert.equal((await readControl(db)).state, 'off', 'disabled: does nothing until a person clears it')
+  })
+
+  it('a late delete does not re-create a deleted managed index', async () => {
+    await managed.setInUse(true)
+    const index = await managed.build(LEGACY)
+    await managed.dropCandidate(index)
+    // A remove whose after-commit write lands after the drop, and a replay batch in flight.
+    await managed.afterWrite(uriOf(1), { version: 99n, es: { index } }, undefined)
+    assert.equal((await bulkManaged(es, index, [{ uri: uriOf(2), version: 100n }])).size, 0)
+    assert.equal(es.indexes.has(index), false)
+    assert.equal(es.indexes.has(`${index}-write`), false)
+  })
+
+  it('reconciling does not count a write that lands during its scan', async () => {
+    await managed.setInUse(true)
+    const index = await managed.build(LEGACY)
+    await managed.markCurrent(index)
+    const realSearch = es.search.bind(es)
+    let raced = false
+    ;(es as unknown as { search: typeof es.search }).search = (async (p: never) => {
+      if (!raced) {
+        raced = true
+        await pg.put(doc(2, 'during the scan'))
+        await pg.remove(uriOf(3))
+      }
+      return realSearch(p)
+    }) as never
+    assert.equal(await managed.reconcile(index), 0, 'both writes carry themselves through es_pending')
+    assert.ok((await managed.pendingCount()) >= 2)
+  })
+
+  it('drains, with an issue, when a write has been pending for 30 minutes', async () => {
+    await db.query(`update search_control set state = 'on', since = now(), es_seen_at = now()`)
+    assert.equal(await controller().drainReason(await readControl(db), 5), undefined)
+    await db.query(`insert into es_pending (uri, version, at) values ($1, 1, now() - interval '31 minutes')`, [uriOf(1)])
+    const d = await controller().drainReason(await readControl(db), 5)
+    assert.match(d!.why, /pending for over 30 minutes/)
+    assert.equal(d!.issue, true)
+  })
+
+  it('opens an issue when Postgres is unverified and Elasticsearch is not in use', async () => {
+    await db.query('update search_control set pg_verified = false')
+    await controller().tick()
+    assert.ok(opened.includes('unverified-outage'))
   })
 
   it('switches on after 3 slow days with enough calls, and not on 2', async () => {

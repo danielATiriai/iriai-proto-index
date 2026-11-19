@@ -40,6 +40,17 @@ export function memoryElastic(index = 'events'): Elastic & {
 } {
   const indexes = new Map<string, Map<string, Stored>>()
   const aliases = new Map<string, string>()
+  /** action.auto_create_index, as Elasticsearch reads it: the first matching pattern decides. */
+  let autoCreate: string | undefined
+  const mayAutoCreate = (name: string) => {
+    if (autoCreate === undefined) return true
+    for (const raw of autoCreate.split(',')) {
+      const sign = raw[0] === '-' ? '-' : '+'
+      const pat = raw.replace(/^[+-]/, '')
+      if (new RegExp(`^${pat.replace(/[.]/g, '\\.').replace(/\*/g, '.*')}$`).test(name)) return sign === '+'
+    }
+    return false
+  }
   const fail = () => {
     es.calls++
     if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
@@ -51,12 +62,16 @@ export function memoryElastic(index = 'events'): Elastic & {
     if (requireAlias) throw responseError(404, 'index_not_found_exception')
     let docs = indexes.get(name)
     // Auto-creation, as Elasticsearch does for a write to a missing index.
-    if (!docs) indexes.set(name, (docs = new Map()))
+    if (!docs) {
+      if (!mayAutoCreate(name)) throw responseError(404, 'index_not_found_exception')
+      indexes.set(name, (docs = new Map()))
+    }
     return docs
   }
   /** Writes one operation; returns the status Elasticsearch would. */
   const write = (name: string, id: string, doc: unknown | undefined, version: number | undefined, requireAlias: boolean): number => {
-    if (doc === undefined && !aliases.has(name) && !indexes.has(name)) return 404
+    // A delete without an external version does not create a missing index; one with does.
+    if (doc === undefined && version === undefined && !aliases.has(name) && !indexes.has(name)) return 404
     const docs = target(name, requireAlias)
     const prior = docs.get(id)
     if (version !== undefined && prior && prior.version >= version) return 409
@@ -88,7 +103,8 @@ export function memoryElastic(index = 'events'): Elastic & {
     },
     delete: async (p: { index: string; id: string; version?: number }, opts: { ignore?: number[] } = {}) => {
       fail()
-      if (!indexes.has(aliases.get(p.index) ?? p.index)) {
+      const missing = !indexes.has(aliases.get(p.index) ?? p.index)
+      if (missing && (p.version === undefined || !mayAutoCreate(p.index))) {
         if (opts.ignore?.includes(404)) return { error: { type: 'index_not_found_exception' } }
         throw responseError(404, 'index_not_found_exception')
       }
@@ -112,7 +128,7 @@ export function memoryElastic(index = 'events'): Elastic & {
           items.push({ index: { status, ...(status === 404 ? { error: { type: 'index_not_found_exception' } } : {}) } })
         } else {
           const m = op.delete as { _index: string; _id: string; version?: number }
-          const exists = indexes.has(aliases.get(m._index) ?? m._index)
+          const exists = indexes.has(aliases.get(m._index) ?? m._index) || (m.version !== undefined && mayAutoCreate(m._index))
           const status = exists ? write(m._index, m._id, undefined, m.version, false) : 404
           items.push({ delete: { status, ...(exists ? {} : { error: { type: 'index_not_found_exception' } }) } })
         }
@@ -128,6 +144,11 @@ export function memoryElastic(index = 'events'): Elastic & {
       health: async () => {
         fail()
         return { status: 'green' }
+      },
+      putSettings: async ({ persistent }: { persistent: Record<string, string> }) => {
+        fail()
+        if ('action.auto_create_index' in persistent) autoCreate = persistent['action.auto_create_index']
+        return { acknowledged: true }
       },
     },
     indices: {
