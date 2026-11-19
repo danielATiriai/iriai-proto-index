@@ -3,6 +3,8 @@ import type { Settings } from '../settings.js'
 import { COLLECTIONS, type Projector } from './projector.js'
 import { Handler, type JetstreamEvent } from './handler.js'
 import { isTransient } from './transient.js'
+import { GitHubIssues } from '../search/issues.js'
+import { ScaleCheck } from '../search/scale.js'
 import { SearchUpkeep } from '../search/verify.js'
 import {
   accountsAwaitingRebuild,
@@ -56,7 +58,7 @@ export interface IngesterStatus {
  * calendar events and PlaceProto event sidecars, handles each event in order,
  * and stores the upstream cursor only after the events before it are handled.
  * A failed event closes the connection and is replayed on reconnect, with
- * backoff. Failures from Postgres, Elasticsearch or the network are retried
+ * backoff. Failures from Postgres or the network are retried
  * for as long as they last; only an event that keeps failing for another
  * reason is skipped, and recorded. Approved accounts are listed in full before
  * the stream starts. Sidecars waiting for their base event, and returning
@@ -67,6 +69,8 @@ export class Ingester {
   readonly status: IngesterStatus = { connected: false, disconnectedSince: Date.now(), handled: 0, errors: 0, skipped: 0 }
   private handler: Handler
   readonly upkeep: SearchUpkeep
+  readonly scale: ScaleCheck
+  private scaling?: Promise<void>
   private stopped = false
   private ws?: Socket
   private queue: Promise<void> = Promise.resolve()
@@ -87,7 +91,9 @@ export class Ingester {
     options: IngesterOptions = {},
   ) {
     this.handler = new Handler(db, projector, log)
-    this.upkeep = new SearchUpkeep(db, projector, log)
+    const issues = new GitHubIssues(db, settings.githubAlertToken, settings.githubAlertRepo, log)
+    this.upkeep = new SearchUpkeep(db, projector, log, Date.now, issues)
+    this.scale = new ScaleCheck(db, settings.thresholds, issues, log)
     this.openSocket = options.openSocket ?? ((url) => new WebSocket(url))
     this.backoffMs = options.backoffMs ?? 1_000
   }
@@ -110,6 +116,12 @@ export class Ingester {
     await this.backfill()
     this.timers.push(setInterval(() => this.enqueue(() => this.retry()), RETRY_MS))
     this.timers.push(setInterval(() => this.enqueue(() => this.upkeep.run()), UPKEEP_MS))
+    // The scale check only counts and reads stats, so it runs beside events, not in their queue.
+    const scale = () => {
+      if (!this.scaling) this.scaling = this.scale.tick().finally(() => (this.scaling = undefined))
+    }
+    scale()
+    this.timers.push(setInterval(scale, UPKEEP_MS))
     await this.connect()
   }
 
@@ -119,6 +131,7 @@ export class Ingester {
     clearTimeout(this.reconnectTimer)
     this.ws?.close()
     await this.queue
+    await this.scaling
     await this.flush()
   }
 

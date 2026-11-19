@@ -2,7 +2,6 @@ import { AtUri } from '@atproto/syntax'
 import type { Db } from '../db.js'
 import { config, eventSidecarNsid } from '../contracts/contracts.js'
 import { assemble, type EventDoc } from '../index/assemble.js'
-import { ElasticBackend, type Elastic } from '../index/elastic.js'
 import { PostgresBackend } from '../search/postgres.js'
 import { NotFound, fetchRecord, listRecords, resolvePds } from './pds.js'
 import {
@@ -20,8 +19,6 @@ export const COLLECTIONS = [config.communityEventCollection, eventSidecarNsid]
 
 export interface ProjectorDeps {
   db: Db
-  es: Elastic
-  index: string
   plcUrl: string
   log?: (msg: string) => void
 }
@@ -30,17 +27,14 @@ export interface ProjectorDeps {
  * Keeps the index in step with stored records: after any record changes, the
  * sidecars it affects are re-assembled and either indexed as complete events
  * or removed, with the outcome kept in index_state for suppression and health.
- * Each change goes to Postgres first and then to today's Elasticsearch index
- * exactly as before; an Elasticsearch failure fails the event, which is
- * replayed (spec 5.1, PR 1).
+ * From PR 2 each change goes to Postgres only: Elasticsearch is not written
+ * (spec 5.1).
  */
 export class Projector {
   readonly postgres: PostgresBackend
-  readonly elastic: ElasticBackend
 
   constructor(private deps: ProjectorDeps) {
     this.postgres = new PostgresBackend(deps.db)
-    this.elastic = new ElasticBackend(deps.es, deps.index)
   }
 
   /** Re-assembles everything a changed record affects. */
@@ -60,29 +54,12 @@ export class Projector {
     await this.projectSidecars([uri], { hydrate })
   }
 
-  /**
-   * Postgres and index_state first, for every sidecar, then today's index.
-   * So an Elasticsearch failure, which fails the event for a replay, never
-   * leaves Postgres or the suppression state behind: a suppressed or deleted
-   * event is already out of Postgres and hidden from open sessions on both
-   * backends (incompleteAmong) before Elasticsearch is touched.
-   */
+  /** Postgres and index_state for every sidecar, then any hydration. */
   async projectSidecars(uris: string[], { hydrate = true } = {}): Promise<void> {
-    const { db } = this.deps
     const done: { uri: string; doc?: EventDoc; hydrate?: string }[] = []
     for (const uri of uris) {
-      const { result, did } = await this.projectPostgres(uri)
-      if (result.complete) {
-        await setIndexState(db, uri, did, true, null)
-        done.push({ uri, doc: result.doc })
-      } else {
-        await setIndexState(db, uri, did, false, result.reason, result.issues ?? null)
-        done.push({ uri, hydrate: result.hydrate })
-      }
-    }
-    for (const d of done) {
-      if (d.doc) await this.elastic.put(d.doc)
-      else await this.elastic.remove(d.uri)
+      const { result } = await this.projectPostgres(uri)
+      done.push(result.complete ? { uri, doc: result.doc } : { uri, hydrate: result.hydrate })
     }
     for (const d of done) {
       if (d.hydrate && hydrate && (await this.hydrate(d.hydrate))) await this.projectSidecars([d.uri], { hydrate: false })
@@ -90,20 +67,38 @@ export class Projector {
   }
 
   /**
-   * Writes one sidecar's current state to Postgres only, from stored records
-   * and with no fetch: the first fill (spec 5.4). Today's index already holds
-   * the same state, and index_state is left as it is.
+   * Writes one sidecar's current state, its event_docs row and its
+   * index_state row, from stored records and with no fetch: the fill (spec
+   * 5.4). A sidecar still waiting for its base event is left pending, and the
+   * ingester's retry hydrates it.
    */
-  async fillPostgres(uri: string): Promise<void> {
-    await this.projectPostgres(uri)
+  async fillSidecar(uri: string): Promise<void> {
+    await this.projectSidecars([uri], { hydrate: false })
   }
 
-  /** Assembles uri from stored records and writes it to Postgres, as one step under the write lock. */
+  /**
+   * Assembles uri from stored records and writes its index_state row and its
+   * event_docs row, as one transaction under the write lock, so the
+   * suppression state and the document never disagree. index_state is
+   * written before event_docs is touched, in the migration's table order.
+   */
   private async projectPostgres(uri: string) {
     return this.postgres.project(uri, async (q) => {
       const assembled = await this.assembleStored(uri, q)
-      return { ...assembled, doc: assembled.result.complete ? assembled.result.doc : undefined }
+      const { result, did } = assembled
+      if (result.complete) await setIndexState(q, uri, did, true, null)
+      else await setIndexState(q, uri, did, false, result.reason, result.issues ?? null)
+      return { ...assembled, doc: result.complete ? result.doc : undefined }
     })
+  }
+
+  /**
+   * One sidecar as stored records assemble it now, through `db` (a snapshot
+   * for the comparison), or undefined when incomplete. Writes nothing.
+   */
+  async assembled(uri: string, db: Db = this.deps.db): Promise<EventDoc | undefined> {
+    const { result } = await this.assembleStored(uri, db)
+    return result.complete ? result.doc : undefined
   }
 
   private async assembleStored(uri: string, db: Db = this.deps.db) {

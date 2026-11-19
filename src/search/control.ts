@@ -10,6 +10,8 @@ export interface ControlRow {
   pgVerified: boolean
   comparedAt: Date | null
   note: string | null
+  /** The fill-and-compare version that last passed (CHECK_VERSION in verify.ts). */
+  checkedBy: number
 }
 
 const READ_EVERY_MS = 30_000
@@ -21,10 +23,6 @@ const READ_EVERY_MS = 30_000
  * falls back rather than hanging.
  */
 export const CONTROL_MS = 500
-/** Every Elasticsearch first page leaves at least this long for its session (spec 3). */
-const COVER_MS = 61 * 60_000
-/** Extending when under 60 minutes remain is enough: a session never outlives 60 of the 61 minutes. */
-const EXTEND_BELOW_MS = 60 * 60_000
 
 /**
  * The query service's own small pool for search_control: two connections,
@@ -48,12 +46,13 @@ export async function readControl(db: Db): Promise<ControlRow> {
     compared_at: Date | null
     note: string | null
     stale: boolean
+    checked_by: number
   }>(
     `select g::text as generation, elastic_cursors_until,
             first_fill_done and fill_generation = g as first_fill_done,
             pg_verified and fill_generation = g as pg_verified,
             case when fill_generation = g then compared_at end as compared_at,
-            note, first_fill_done and fill_generation <> g as stale
+            note, first_fill_done and fill_generation <> g as stale, checked_by
      from search_control, search_generation_now() as g where id = 1`,
   )
   const r = res.rows[0]
@@ -63,6 +62,7 @@ export async function readControl(db: Db): Promise<ControlRow> {
     firstFillDone: r.first_fill_done,
     pgVerified: r.pg_verified,
     comparedAt: r.compared_at,
+    checkedBy: r.checked_by,
     note: r.stale ? 'ingestion tables were changed by code that does not write event_docs; filling again' : r.note,
   }
 }
@@ -89,35 +89,6 @@ export class SearchControl {
     this.row = await this.bounded((q) => readControl(q))
     this.readAt = this.now()
     return this.row
-  }
-
-  /**
-   * Whether an Elasticsearch cursor may still be sent to Elasticsearch. A
-   * stale "no" is checked against the table before it is given, since another
-   * replica may have moved the time on.
-   */
-  async elasticCursorsOpen(): Promise<boolean> {
-    if ((await this.current()).elasticCursorsUntil.getTime() > this.now()) return true
-    return (await this.refresh()).elasticCursorsUntil.getTime() > this.now()
-  }
-
-  /**
-   * Called before an Elasticsearch first page returns: moves
-   * elastic_cursors_until to at least now + 61 minutes, writing the row only
-   * when less than 60 minutes remain.
-   */
-  async coverElasticSession(): Promise<void> {
-    const row = await this.current()
-    if (row.elasticCursorsUntil.getTime() >= this.now() + EXTEND_BELOW_MS) return
-    const until = new Date(this.now() + COVER_MS)
-    const res = await this.bounded((q) =>
-      q.query<{ elastic_cursors_until: Date }>(
-        `update search_control set elastic_cursors_until = greatest(elastic_cursors_until, $1), updated_at = now()
-         where id = 1 returning elastic_cursors_until`,
-        [until],
-      ),
-    )
-    row.elasticCursorsUntil = res.rows[0].elastic_cursors_until
   }
 
   /**
@@ -175,13 +146,9 @@ export interface Route {
 }
 
 /**
- * The rule of spec 5.2 for a new session, as PR 1 has it: the chosen backend
- * (SEARCH_BACKEND_FORCE, default elastic) if it may serve, else Postgres if
- * verified, else nothing. Today's index may serve throughout PR 1, since it is
- * written as before; Postgres may serve once verified.
+ * The rule of spec 5.2 for a new session from PR 2: Postgres if verified,
+ * else nothing. Elasticsearch is not written, so it may not serve.
  */
-export function route(force: BackendName, row: Pick<ControlRow, 'pgVerified'>): Route | undefined {
-  if (force === 'elastic') return { backend: 'elastic', reason: 'SEARCH_BACKEND_FORCE=elastic (default)' }
-  if (row.pgVerified) return { backend: 'postgres', reason: 'SEARCH_BACKEND_FORCE=postgres, Postgres verified' }
-  return undefined
+export function route(row: Pick<ControlRow, 'pgVerified'>): Route | undefined {
+  return row.pgVerified ? { backend: 'postgres', reason: 'Postgres verified; Elasticsearch is off' } : undefined
 }

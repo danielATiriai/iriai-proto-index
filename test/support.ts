@@ -1,12 +1,9 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { errors } from '@elastic/elasticsearch'
 import pg from 'pg'
 import { connect, migrate, type Db } from '../src/db.js'
-import type { Elastic } from '../src/index/elastic.js'
 
 export const databaseUrl = process.env.TEST_DATABASE_URL
-export const elasticUrl = process.env.TEST_ELASTICSEARCH_URL
 
 /** A fresh database per test file, so files can run in any order. */
 export async function freshDb(name: string): Promise<Db> {
@@ -20,33 +17,6 @@ export async function freshDb(name: string): Promise<Db> {
   const db = connect(url.toString())
   await migrate(db)
   return db
-}
-
-/** Just enough of the Elasticsearch client for the projector, kept in memory. Writes fail while `down` is set. */
-export function memoryElastic(): Elastic & { docs: Map<string, unknown>; down: boolean } {
-  const docs = new Map<string, unknown>()
-  const es = {
-    docs,
-    down: false,
-    index: async ({ id, document }: { id: string; document: unknown }) => {
-      if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
-      docs.set(id, document)
-    },
-    delete: async ({ id }: { id: string }) => {
-      if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
-      docs.delete(id)
-    },
-    get: async ({ id }: { id: string }) => (docs.has(id) ? { found: true, _source: docs.get(id) } : { found: false }),
-    indices: {
-      exists: async () => {
-        if (es.down) throw new errors.ConnectionError('connect ECONNREFUSED elasticsearch')
-        return true
-      },
-      refresh: async () => {},
-    },
-    search: async () => ({ hits: { hits: [...docs].map(([id, doc]) => ({ _id: id, _source: doc })) } }),
-  }
-  return es as never
 }
 
 /** The pool, with every query failing like an unreachable Postgres while `down` is set. */

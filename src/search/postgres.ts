@@ -57,8 +57,9 @@ export class PostgresBackend implements SearchBackend {
       async (client, version) => {
         if (out!.doc) await insertDoc(client, version, out!.doc)
       },
-      // Read before event_docs is touched, so the transaction locks tables in
-      // the migration's order (records, accounts, then event_docs).
+      // Read (and index_state written) before event_docs is touched, so the
+      // transaction locks tables in the migration's order (records, accounts,
+      // index_state, then event_docs).
       async (client) => {
         out = await assemble(client as unknown as Db)
       },

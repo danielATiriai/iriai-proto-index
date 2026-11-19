@@ -1,7 +1,7 @@
 /**
  * Per-caller limits for the open YC query API (D-14: open with rate limits,
  * labelled interim): requests per minute, and new paging sessions per hour,
- * since each holds an Elasticsearch point-in-time snapshot.
+ * since each holds a search snapshot open for up to an hour.
  */
 export class Limits {
   private requests = new Map<string, { windowStart: number; count: number }>()

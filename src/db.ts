@@ -138,9 +138,10 @@ create index if not exists event_docs_closed_point on event_docs (lat, lon) wher
 create index if not exists event_docs_closed_span on event_docs using gist (event_span(starts_at, ends_at)) where closed_version is not null;
 create index if not exists event_docs_closed_at on event_docs (closed_at) where closed_version is not null;
 
--- Search routing state, one row (spec 6; PR 2 adds the controller's columns).
--- elastic_cursors_until: Elasticsearch cursors are honored until then (the
--- row and its cover are written after this script; see migrate()).
+-- Search routing state, one row (spec 6).
+-- elastic_cursors_until: written since PR 1 and no longer read: from PR 2
+-- every Elasticsearch cursor has expired (the row is written after this
+-- script; see migrate()).
 -- generation: moved on by every change to an ingestion table from code that
 -- does not write event_docs.
 create table if not exists search_control (
@@ -168,13 +169,24 @@ $fn$;
 -- stale. Any such change moves the generation on, which voids the first
 -- fill and verification, so the next upkeep fills event_docs again and
 -- compares before Postgres may serve.
--- Every table the ingester writes is watched, not only index_state: older
--- code changes records or accounts first and may fail before index_state.
+-- Every table event_docs is built from is watched, not only index_state:
+-- older code changes records or accounts first and may fail before
+-- index_state. checkpoints and skipped_events still carry PR 1's triggers
+-- but no longer move it: neither feeds event_docs, and since PR 2 a moved
+-- generation means 503s until upkeep fills again, so clearing skipped
+-- events by hand must not cause one. (A function change takes no table lock.)
 create or replace function search_foreign_write() returns trigger language plpgsql as $fn$
 begin
-  if coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
+  if TG_TABLE_NAME not in ('checkpoints', 'skipped_events')
+     and coalesce(current_setting('iriai.search_writer', true), '') <> '1' then
     perform nextval('search_generation');
   end if;
+  return null;
+end
+$fn$;
+create or replace function search_truncate() returns trigger language plpgsql as $fn$
+begin
+  perform nextval('search_generation');
   return null;
 end
 $fn$;
@@ -190,6 +202,57 @@ begin
       execute format('create trigger %I after insert or update or delete on %I for each statement execute function search_foreign_write()', t || '_foreign_write', t);
     end if;
   end loop;
+  -- PR 2: TRUNCATE moves the generation too, from any connection, this code's
+  -- included (nothing here truncates). Only when missing, as above.
+  foreach t in array array['records', 'accounts', 'index_state'] loop
+    if not exists (select 1 from pg_trigger where tgname = t || '_foreign_truncate' and tgrelid = t::regclass) then
+      execute format('create trigger %I after truncate on %I for each statement execute function search_truncate()', t || '_foreign_truncate', t);
+    end if;
+  end loop;
+end
+$do$;
+
+-- PR 2 (spec 6.1, 6.2): one row per UTC day of queryEvents calls, the
+-- Postgres search step's timings as a histogram (bucket i counts searches
+-- under SEARCH_BUCKETS_MS[i], the last bucket 2 s and over), Postgres
+-- timeouts, and the current event count. Kept 90 days.
+create table if not exists search_stats (
+  day date primary key,
+  calls bigint not null default 0,
+  pg_hist bigint[] not null default '{}',
+  pg_timeouts bigint not null default 0,
+  events bigint
+);
+
+-- Adds two histograms element by element; a shorter one counts as zeros.
+create or replace function add_hist(a bigint[], b bigint[]) returns bigint[] language sql immutable parallel safe as $fn$
+  select coalesce(array_agg(coalesce(x, 0) + coalesce(y, 0) order by i), '{}') from unnest(a, b) with ordinality as t(x, y, i)
+$fn$;
+
+-- When each kind of GitHub issue was last delivered, so one cause opens at
+-- most one issue a day.
+-- The ingester's last scale check, for the query service's health.
+create table if not exists search_scale (
+  id integer primary key check (id = 1),
+  checked_at timestamptz not null,
+  events bigint not null,
+  trigger_reason text
+);
+
+create table if not exists search_alerts (
+  key text primary key,
+  opened_at timestamptz not null
+);
+-- PR 2: the fill-and-compare version that last passed (CHECK_VERSION in
+-- src/search/verify.ts); a lower one is filled and compared again once.
+-- Only when missing, as for accounts.needs_rebuild, and last: the ALTER
+-- holds search_control exclusively until the migration commits, so it is
+-- not held while an earlier statement waits on an ingestion table.
+do $do$
+begin
+  if not exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'search_control' and column_name = 'checked_by') then
+    alter table search_control add column checked_by integer not null default 0;
+  end if;
 end
 $do$;
 `
@@ -231,9 +294,9 @@ export async function migrate(db: Db): Promise<void> {
   try {
     await client.query('select pg_advisory_lock(7140014)')
     await client.query(MIGRATION)
-    // Last, on its own: every start covers the hour of Elasticsearch cursors
-    // a previous deployment (which may not have recorded them) could have
-    // issued. Nothing above holds search_control's row while tables are locked.
+    // Last, on its own: creates search_control's row. elastic_cursors_until is
+    // kept so a revert to PR 1 finds it; nothing here reads it. Nothing above
+    // holds search_control's row while tables are locked.
     await client.query(
       `insert into search_control (id, elastic_cursors_until) values (1, now() + interval '61 minutes')
        on conflict (id) do update set elastic_cursors_until = greatest(search_control.elastic_cursors_until, excluded.elastic_cursors_until)`,

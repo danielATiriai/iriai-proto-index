@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { createQueryServer } from '../src/query/server.js'
+import { createQueryServer, publicNote } from '../src/query/server.js'
 
 describe('query server', () => {
   let server: Server
@@ -33,5 +33,14 @@ describe('query server', () => {
     assert.equal(((await limited.json()) as { error: string }).error, 'RateLimitExceeded')
     assert.ok(Number(limited.headers.get('retry-after')) > 0)
     assert.equal((await get('203.0.113.8', '198.51.100.2')).status, 400)
+  })
+
+  it('shows no identifier from an older version\'s comparison note in public health', () => {
+    const old = 'did not match today\'s index: only in Postgres at://did:plc:abc/app.iriai.proto.event/3k1, at://did:plc:def/app.iriai.proto.event/3k2; different did:plc:xyz'
+    const shown = publicNote(old)!
+    assert.doesNotMatch(shown, /at:\/\/|did:plc/)
+    assert.match(shown, /only in Postgres \[id\], \[id\]/)
+    assert.equal(publicNote('matched stored records: 3 documents'), 'matched stored records: 3 documents')
+    assert.equal(publicNote(null), null)
   })
 })
