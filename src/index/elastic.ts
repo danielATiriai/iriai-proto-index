@@ -242,24 +242,4 @@ export class ElasticBackend implements SearchBackend {
   async count(opts: CallOptions = {}): Promise<number> {
     return (await this.es.count({ index: this.index }, opts)).count
   }
-
-  /** Every document in the index, for the verifying comparison; refreshes first so recent writes are seen. */
-  async allDocs(): Promise<Map<string, EventDoc>> {
-    await this.es.indices.refresh({ index: this.index })
-    const out = new Map<string, EventDoc>()
-    let after: unknown[] | undefined
-    for (;;) {
-      const res = await this.es.search<EventDoc>({
-        index: this.index,
-        size: 1000,
-        sort: [{ uri: { order: 'asc' } }] as never,
-        ...(after ? { search_after: after as never } : {}),
-        track_total_hits: false,
-      })
-      const hits = res.hits.hits
-      for (const h of hits) out.set(h._id!, h._source!)
-      if (hits.length < 1000) return out
-      after = hits[hits.length - 1].sort
-    }
-  }
 }

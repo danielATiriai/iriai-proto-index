@@ -134,10 +134,9 @@ export class SearchUpkeep {
     let ok = false
     let ran = false
     let note: string
-    let against = 'its copy'
+    const against = 'stored records assembled again'
     const { generation } = await readControl(this.db)
     try {
-      against = 'stored records assembled again'
       const [pg, es] = [await this.projector.postgres.currentDocs(), await this.reassembled()]
       const missing = [...es.keys()].filter((uri) => !pg.has(uri))
       const extra = [...pg.keys()].filter((uri) => !es.has(uri))

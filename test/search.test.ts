@@ -941,14 +941,18 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
   it('does not verify when index_state changes from old code while the comparison runs', async () => {
     await db.query('update search_control set pg_verified = false, compared_at = null')
     const upkeep = new SearchUpkeep(db, projector, () => {})
-    const real = projector.elastic.allDocs.bind(projector.elastic)
-    projector.elastic.allDocs = async () => {
-      const docs = await real()
-      const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
-      await old.connect()
-      await old.query(`update index_state set updated_at = now() where uri = $1`, [`at://${AUTHOR}/${SIDECAR}/3ks2`])
-      await old.end()
-      return docs
+    const real = projector.assembled.bind(projector)
+    let once = false
+    projector.assembled = async (uri: string) => {
+      const doc = await real(uri)
+      if (!once) {
+        once = true
+        const old = new pg.Client({ connectionString: dbUrl('upkeep_test') })
+        await old.connect()
+        await old.query(`update index_state set updated_at = now() where uri = $1`, [`at://${AUTHOR}/${SIDECAR}/3ks2`])
+        await old.end()
+      }
+      return doc
     }
     try {
       const res = await upkeep.compare()
@@ -957,7 +961,7 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
       assert.equal(row.pgVerified, false)
       assert.equal(row.firstFillDone, false)
     } finally {
-      projector.elastic.allDocs = real
+      projector.assembled = real
     }
     await upkeep.run()
     assert.equal((await readControl(db)).pgVerified, true)
@@ -1015,8 +1019,11 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
     await db.query('update search_control set pg_verified = false, first_fill_done = true, fill_generation = search_generation_now(), compared_at = null')
     const extra = { ...(await projector.postgres.get(`at://${AUTHOR}/${SIDECAR}/3ks1`))!, uri: `at://${AUTHOR}/${SIDECAR}/3ksgone` }
     await projector.postgres.put(extra)
-    const real = projector.elastic.allDocs.bind(projector.elastic)
-    projector.elastic.allDocs = async () => {
+    const real = projector.assembled.bind(projector)
+    let once = false
+    projector.assembled = async (uri: string) => {
+      if (once) return real(uri)
+      once = true
       // The server ends the session holding the upkeep lock mid-comparison;
       // another ingester could now take the lock and verify.
       const holder = await db.query<{ pid: number }>(`select pid from pg_locks where locktype = 'advisory' and objid = 7140016 and granted`)
@@ -1025,12 +1032,12 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
       await new Promise((r) => setTimeout(r, 100))
       // Another ingester's upkeep, holding the lock now, verifies.
       await db.query('update search_control set pg_verified = true, compared_at = now()')
-      return real()
+      return real(uri)
     }
     try {
       await new SearchUpkeep(db, projector, () => {}).run()
     } finally {
-      projector.elastic.allDocs = real
+      projector.assembled = real
       await projector.postgres.remove(extra.uri)
     }
     const row = await readControl(db)
@@ -1040,14 +1047,14 @@ describe('first fill and the verifying comparison', { skip: (!databaseUrl || !el
 
   it('leaves verification as it is when a comparison cannot run', async () => {
     await db.query('update search_control set pg_verified = true, first_fill_done = true, fill_generation = search_generation_now()')
-    const real = projector.elastic.allDocs.bind(projector.elastic)
-    projector.elastic.allDocs = async () => Promise.reject(new Error('connect ECONNREFUSED'))
+    const real = projector.assembled.bind(projector)
+    projector.assembled = async () => Promise.reject(new Error('connection terminated'))
     try {
       const res = await new SearchUpkeep(db, projector, () => {}).compare()
       assert.equal(res.ok, false)
       assert.equal((await readControl(db)).pgVerified, true)
     } finally {
-      projector.elastic.allDocs = real
+      projector.assembled = real
     }
   })
 

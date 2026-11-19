@@ -195,8 +195,10 @@ export class SearchController {
       // With SEARCH_ES on, use does not end; draining has already moved new
       // sessions to Postgres, which off keeps doing.
       if (row.state === 'draining') return this.setState('off', 'drained; SEARCH_ES=on keeps Elasticsearch in use')
-      // Before any Elasticsearch call, so an outage still names this cause.
-      if ((await managed.stalePending(STUCK_MS)) > 0) {
+      // Before any Elasticsearch call, so an outage still names this cause,
+      // and instead of the build issue below.
+      const stuck = (await managed.stalePending(STUCK_MS)) > 0
+      if (stuck) {
         await this.deps.issues.open(
           'pending',
           'Search: Elasticsearch writes have been pending for over 30 minutes',
@@ -217,7 +219,7 @@ export class SearchController {
         }
       } catch (err) {
         this.log(`elasticsearch: ${(err as Error).message}`)
-        await this.deps.issues.open(
+        if (!stuck) await this.deps.issues.open(
           'build',
           'Search: the managed Elasticsearch index could not be built or reconciled',
           'Details are in the ingester log. Postgres keeps serving new sessions; the controller retries every 10 minutes.',

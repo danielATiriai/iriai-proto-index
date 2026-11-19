@@ -39,7 +39,7 @@ export interface ProjectorDeps {
  */
 export class Projector {
   readonly postgres: PostgresBackend
-  /** Today's index, read only by the PR 1 comparison tools; never written from PR 2. */
+  /** Elasticsearch; a managed index is reached through withIndex. Today's index is never written from PR 2. */
   readonly elastic: ElasticBackend
   readonly managed: ManagedIndex
 

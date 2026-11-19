@@ -1,7 +1,8 @@
-import type { Db } from '../db.js'
+import { checkout, type Db } from '../db.js'
 import type { EventDoc } from '../index/assemble.js'
 import type { EventQuery } from '../query/params.js'
 import type { SearchBackend } from './backend.js'
+import { WRITE_LOCK } from './postgres.js'
 import { queryOfShape, storedShapes } from './stats.js'
 
 /** First results compared per shape (spec 6.4, verifying). */
@@ -143,8 +144,21 @@ export async function backendsAgree(
   return { ok: true, shapes: shapes.length }
 }
 
+/** The last version number, read under the shared write lock: every write numbered up to it has committed. */
 async function sequenceNow(db: Db): Promise<string> {
-  return (await db.query<{ w: string }>(`select (case when is_called then last_value else 0 end)::text as w from event_doc_version`)).rows[0].w
+  const client = await checkout(db)
+  try {
+    await client.query('begin')
+    await client.query('select pg_advisory_xact_lock_shared($1)', [WRITE_LOCK])
+    const w = (await client.query<{ w: string }>(`select (case when is_called then last_value else 0 end)::text as w from event_doc_version`)).rows[0].w
+    await client.query('commit')
+    return w
+  } catch (err) {
+    await client.query('rollback').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
 }
 
 async function changedSince(db: Db, uris: string[], w: string): Promise<boolean> {
