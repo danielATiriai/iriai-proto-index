@@ -82,6 +82,10 @@ export class SearchStats {
   }
 
   async flush(): Promise<void> {
+    // Taken before any wait, so a day that rolls meanwhile is not reset away.
+    const out = { day: this.day, calls: this.calls, pg: this.pg, pgTimeouts: this.pgTimeouts }
+    const empty = out.calls === 0 && out.pg.every((n) => n === 0)
+    if (!empty) this.reset(this.day)
     // An earlier day whose flush failed is written first.
     const carried = this.carried.splice(0)
     for (let i = 0; i < carried.length; i++) {
@@ -89,12 +93,11 @@ export class SearchStats {
         await addStats(this.db, carried[i])
       } catch (err) {
         this.carried.unshift(...carried.slice(i))
+        if (!empty) this.carried.push(out)
         throw err
       }
     }
-    const out = { day: this.day, calls: this.calls, pg: this.pg, pgTimeouts: this.pgTimeouts }
-    if (out.calls === 0 && out.pg.every((n) => n === 0)) return
-    this.reset(this.day)
+    if (empty) return
     try {
       await addStats(this.db, out)
     } catch (err) {
