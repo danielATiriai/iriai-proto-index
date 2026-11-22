@@ -5,7 +5,6 @@ import type { BackendName } from './backend.js'
 export interface ControlRow {
   /** Moved on by every change to an ingestion table from code that does not write event_docs. */
   generation: string
-  elasticCursorsUntil: Date
   firstFillDone: boolean
   pgVerified: boolean
   comparedAt: Date | null
@@ -40,7 +39,6 @@ export async function readControl(db: Db): Promise<ControlRow> {
   // the fill finished at; once it moves, they read as not done.
   const res = await db.query<{
     generation: string
-    elastic_cursors_until: Date
     first_fill_done: boolean
     pg_verified: boolean
     compared_at: Date | null
@@ -48,7 +46,7 @@ export async function readControl(db: Db): Promise<ControlRow> {
     stale: boolean
     checked_by: number
   }>(
-    `select g::text as generation, elastic_cursors_until,
+    `select g::text as generation,
             first_fill_done and fill_generation = g as first_fill_done,
             pg_verified and fill_generation = g as pg_verified,
             case when fill_generation = g then compared_at end as compared_at,
@@ -58,7 +56,6 @@ export async function readControl(db: Db): Promise<ControlRow> {
   const r = res.rows[0]
   return {
     generation: r.generation,
-    elasticCursorsUntil: r.elastic_cursors_until,
     firstFillDone: r.first_fill_done,
     pgVerified: r.pg_verified,
     comparedAt: r.compared_at,
