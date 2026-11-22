@@ -379,18 +379,6 @@ describe('search routing', { skip: !databaseUrl && 'TEST_DATABASE_URL not set' }
     }
   })
 
-  /** Health's index, from a server on `s`. */
-  const healthIndex = async (s: Search) => {
-    const server = createQueryServer({ db, search: s, serviceId: 'test', cursorKey: deps.cursorKey, rateLimitPerMinute: 100, pagingSessionsPerHour: 100 })
-    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
-    try {
-      const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/xrpc/_health`)
-      return ((await res.json()) as { index: { ok: boolean; backend?: string } }).index
-    } finally {
-      await new Promise<void>((r) => server.close(() => r()))
-    }
-  }
-
   it('migrates again while a projection holds event_docs and then reads accounts, without a deadlock', async () => {
     const a = new pg.Client({ connectionString: dbUrl('routing_test') })
     await a.connect()
